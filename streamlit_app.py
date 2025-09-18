@@ -2,32 +2,27 @@
 import os
 import math
 import pytz
-import time
-import json
 import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf
 from datetime import datetime, date, timedelta
 from transformers import pipeline
 from sklearn.linear_model import SGDRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 
-# Data providers
-import yfinance as yf
+# NSEpy import and date
 from datetime import date as dte
 from nsepy import get_history
 
 # ===============================
-# Config & Globals
+# Configuration & Globals
 # ===============================
-st.set_page_config(page_title="NSE/BSE Expert Predictor (Single File with NSEpy)", layout="wide")
-
+st.set_page_config(page_title="NSE/BSE Expert Predictor (Fixed Merge)", layout="wide")
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 FINBERT_MODEL = os.environ.get("FINBERT_MODEL", "ProsusAI/finbert")
-
-# Optional earnings API (skip if no key)
 EARNINGS_API_URL = os.environ.get("EARNINGS_API_URL", "https://api.api-ninjas.com/v1/earningscalendar")
 EARNINGS_API_KEY = os.environ.get("EARNINGS_API_KEY", "")
 
@@ -53,22 +48,17 @@ def guess_tickers(user_query: str):
     return [f"{q}.NS", f"{q}.BO"]
 
 def resolve_valid_ticker(user_query: str):
-    # Try NSEpy for NSE symbol first by stripping suffix and using get_history
     candidates = guess_tickers(user_query)
     for t in candidates:
         sym_clean = t.replace(".NS","").replace(".BO","")
         try:
-            df = get_history(symbol=sym_clean.lower(),  # NSEpy often expects lowercase symbols
-                             start=dte(2024,1,1),
-                             end=dte(2024,2,1))
+            df = get_history(symbol=sym_clean.lower(), start=dte(2024,1,1), end=dte(2024,2,1))
             if df is not None and len(df.dropna()) > 0:
-                # Confirm with yfinance to ensure data alignment
                 yfd = yf.download(f"{sym_clean}.NS", period="3mo", interval="1d", auto_adjust=True, progress=False)
                 if yfd is not None and len(yfd.dropna()) > 10:
                     return f"{sym_clean}.NS"
         except Exception:
             pass
-    # Fallback: test via yfinance directly
     for t in candidates:
         try:
             yfd = yf.download(t, period="3mo", interval="1d", auto_adjust=True, progress=False)
@@ -79,23 +69,18 @@ def resolve_valid_ticker(user_query: str):
     return None
 
 def fetch_prices_nse_first(symbol: str, start_date: date, end_date: date):
-    # Try NSEpy for NSE; fallback to yfinance
     sym_clean = symbol.replace(".NS","").replace(".BO","")
     try:
         df = get_history(symbol=sym_clean.lower(),
                          start=dte(start_date.year, start_date.month, start_date.day),
                          end=dte(end_date.year, end_date.month, end_date.day))
         if df is not None and len(df) > 0:
-            out = df.rename(columns={
-                "Open":"Open","High":"High","Low":"Low","Close":"Close","VWAP":"VWAP","Volume":"Volume"
-            })
+            out = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","VWAP":"VWAP","Volume":"Volume"})
             out.index = pd.to_datetime(out.index)
-            # Ensure standard columns exist
             cols = [c for c in ["Open","High","Low","Close","Volume"] if c in out.columns]
             return out[cols].dropna()
     except Exception:
         pass
-    # yfinance fallback
     yf_ticker = symbol if (symbol.endswith(".NS") or symbol.endswith(".BO")) else f"{sym_clean}.NS"
     yfd = yf.download(yf_ticker, start=start_date, end=end_date, interval="1d", auto_adjust=True, progress=False)
     return yfd.dropna()
@@ -161,10 +146,8 @@ def fetch_earnings_calendar(symbol: str, limit: int = 5):
 
 def fetch_india_vix(start_date: date, end_date: date):
     try:
-        vix = get_history(symbol="INDIAVIX",
-                          start=dte(start_date.year,start_date.month,start_date.day),
-                          end=dte(end_date.year,end_date.month,end_date.day),
-                          index=True)
+        vix = get_history(symbol="INDIAVIX", start=dte(start_date.year,start_date.month,start_date.day),
+                          end=dte(end_date.year,end_date.month,end_date.day), index=True)
         vix = vix.rename(columns={"Close":"VIX"}).filter(["VIX"])
         vix.index = pd.to_datetime(vix.index)
         return vix
@@ -186,61 +169,66 @@ def build_features(px: pd.DataFrame, vix: pd.DataFrame):
     d["ma_20"] = d["Close"].rolling(20).mean()
     d["ma_ratio"] = d["ma_5"] / d["ma_20"]
     d["rsi_14"] = compute_rsi(d["Close"], 14)
-    # Join VIX
-    if vix is not None and "VIX" in vix.columns and len(vix)>0:
+    if vix is not None and "VIX" in vix.columns and len(vix) > 0:
         d = d.join(vix, how="left")
-        d["VIX"] = d["VIX"].fillna(method="ffill").fillna(d["VIX"].median() if len(d["VIX"].dropna())>0 else 0)
+        d["VIX"] = d["VIX"].fillna(method="ffill").fillna(d["VIX"].median() if len(d["VIX"].dropna()) > 0 else 0)
     else:
         d["VIX"] = 0.0
     return d.dropna()
 
 def aggregate_sentiment(sent_df: pd.DataFrame):
-    if sent_df is None or len(sent_df)==0:
+    if sent_df is None or len(sent_df) == 0:
         return pd.DataFrame(columns=["date","sent_mean","sent_count","sent_pos","sent_neg"])
     df = sent_df.copy()
     df["date"] = df["pubDate"].dt.floor("1D")
     label_to_sign = {"positive": 1, "negative": -1, "neutral": 0}
     df["signed"] = df["sentiment"].str.lower().map(label_to_sign).fillna(0) * df["score"]
     agg = df.groupby("date").agg(
-        sent_pos=("signed", lambda s: (s[s>0]).sum()),
-        sent_neg=("signed", lambda s: (s[s<0]).sum()),
+        sent_pos=("signed", lambda s: (s[s > 0]).sum()),
+        sent_neg=("signed", lambda s: (s[s < 0]).sum()),
         sent_mean=("signed", "mean"),
-        sent_count=("signed","count"),
+        sent_count=("signed", "count"),
     ).reset_index()
+    # FIX: Deduplicate index for joining
+    agg = agg.drop_duplicates(subset=["date"]).set_index("date")
+    agg.index = pd.to_datetime(agg.index)
     return agg
 
 def earnings_days_feature(ev: pd.DataFrame, price_index: pd.DatetimeIndex):
-    if ev is None or len(ev)==0:
+    if ev is None or len(ev) == 0:
         return pd.Series(0, index=price_index, name="days_to_earnings")
     events = ev.copy()
     if "date" in events.columns:
         events["date"] = pd.to_datetime(events["date"], errors="coerce")
     next_dates = events["date"].dropna().sort_values().values
-    if len(next_dates)==0:
+    if len(next_dates) == 0:
         return pd.Series(0, index=price_index, name="days_to_earnings")
     days = []
     for d in price_index:
         if (next_dates > np.datetime64(d)).any():
             nd = next_dates[next_dates > np.datetime64(d)][0]
-            days.append((pd.Timestamp(nd)-pd.Timestamp(d)).days)
+            days.append((pd.Timestamp(nd) - pd.Timestamp(d)).days)
         else:
             days.append(0)
     return pd.Series(days, index=price_index, name="days_to_earnings")
 
 def make_dataset(px: pd.DataFrame, sent_daily: pd.DataFrame, earn_df: pd.DataFrame, vix: pd.DataFrame, horizon_days: int):
     tech = build_features(px, vix)
-    if len(tech)==0:
+    if len(tech) == 0:
         return None, None, None, None
-    if sent_daily is not None and "date" in sent_daily.columns:
-        sent_daily = sent_daily.set_index("date")
-    df = tech.join(sent_daily[["sent_mean","sent_count","sent_pos","sent_neg"]] if sent_daily is not None else None, how="left")
+    if sent_daily is not None:
+        sent_daily = sent_daily[~sent_daily.index.duplicated(keep='first')]
+        sent_daily = sent_daily.loc[~sent_daily.index.isnull()]
+    else:
+        sent_daily = pd.DataFrame(columns=["sent_mean", "sent_count", "sent_pos", "sent_neg"])
+    df = tech.join(sent_daily[["sent_mean", "sent_count", "sent_pos", "sent_neg"]] if sent_daily is not None else None, how="left")
     df["days_to_earnings"] = earnings_days_feature(earn_df, df.index)
     df[["sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]] = \
         df[["sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]].fillna(0)
     y = df["Close"].shift(-horizon_days)
     feature_cols = ["ret_1","ret_5","ma_5","ma_20","ma_ratio","rsi_14","VIX","sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]
     out = pd.concat([df[feature_cols], y.rename("y")], axis=1).dropna()
-    if len(out)==0:
+    if len(out) == 0:
         return None, None, None, None
     X = out.drop(columns=["y"]).values
     y = out["y"].values
@@ -311,7 +299,6 @@ def action_from_prediction(last_close: float, pred_price: float, sigma: float, s
     return action, entry, stoploss, target, exp_pct_clipped, direction
 
 def position_size_15k(entry_price: float, stoploss_price: float, max_capital_inr: float = 15000.0, risk_pct: float = 0.01):
-    # Classic 1% risk-per-trade position sizing widely discussed in trading literature [Risk rule context]
     max_risk = max_capital_inr * risk_pct
     if entry_price is None or entry_price <= 0:
         return 1, 0.0, max_risk
@@ -334,7 +321,7 @@ def position_size_15k(entry_price: float, stoploss_price: float, max_capital_inr
 # ===============================
 # UI
 # ===============================
-st.title("NSE/BSE Expert Trade Predictor — Single File (NSEpy + Sentiment + Events)")
+st.title("NSE/BSE Expert Trade Predictor — Fixed Merge Error")
 
 c0, c1, c2 = st.columns([2,1,1])
 with c0:
@@ -374,7 +361,6 @@ if st.button("Get Prediction"):
 
     sent_daily = aggregate_sentiment(sent_df)
     pred = train_and_predict(px, sent_daily, earn_df, vix, horizon_days=horizon_days)
-
     if pred is None:
         st.error("Not enough data to build a prediction. Try increasing lookback days.")
         st.stop()
@@ -385,8 +371,8 @@ if st.button("Get Prediction"):
     mae = float(pred["mae"])
     r2 = float(pred["r2"])
 
-    latest_date = sent_daily["date"].max() if (sent_daily is not None and "date" in sent_daily.columns and len(sent_daily)>0) else None
-    latest_sent_row = sent_daily[sent_daily["date"]==latest_date].iloc[0] if latest_date is not None else None
+    latest_date = sent_daily.index.max() if sent_daily is not None and len(sent_daily)>0 else None
+    latest_sent_row = sent_daily.loc[latest_date] if latest_date is not None else None
     earn_days_series = earnings_days_feature(earn_df, px.index)
     days_to_earn = float(earn_days_series.iloc[-1]) if (earn_days_series is not None and len(earn_days_series)>0) else None
 
@@ -406,12 +392,11 @@ if st.button("Get Prediction"):
         st.write(f"STOPLOSS: {'{:.2f}'.format(stoploss)}")
     else:
         st.write("STOPLOSS: N/A (HOLD)")
-    st.write(f"PREDICTION_DATE (+{horizon_days}D): { (datetime.now(INDIA_TZ)+timedelta(days=horizon_days)).strftime('%Y-%m-%d') }")
+    st.write(f"PREDICTION_DATE (+{horizon_days}D): {(datetime.now(INDIA_TZ)+timedelta(days=horizon_days)).strftime('%Y-%m-%d')}")
     st.write(f"PREDICTED PRICE: {'{:.2f}'.format(target)}")
     st.write(f"HOW MUCH % WILL GO {direction}: {exp_pct*100:.2f}%")
     st.write(f"HOW MANY QTY TO {'BUY' if action!='SELL' else 'SELL'} (<= ₹15,000): {qty} (approx capital ₹{total_cap:,.0f}, max risk/trade ₹{max_risk:,.0f})")
 
-    # Explain section
     reasons = []
     feats = pred["features_tail"].iloc[0]
     if feats.get("ma_ratio", 1.0) > 1.0:
@@ -429,7 +414,7 @@ if st.button("Get Prediction"):
             reasons.append("Recent news sentiment is net negative.")
     if days_to_earn is not None and 0 <= days_to_earn <= 3:
         reasons.append("Earnings nearby; confidence reduced and stop widened.")
-    if vix is not None and len(vix)>0 and float(vix.iloc[-1].get("VIX", 0)) > (vix["VIX"].median() if "VIX" in vix.columns and len(vix["VIX"].dropna())>0 else 0):
+    if vix is not None and len(vix) > 0 and float(vix.iloc[-1].get("VIX", 0)) > (vix["VIX"].median() if "VIX" in vix.columns and len(vix["VIX"].dropna()) > 0 else 0):
         reasons.append("Elevated India VIX indicates higher market volatility.")
     if not reasons:
         reasons.append("Model-based projection blended with sentiment, VIX, and earnings proximity.")
@@ -443,4 +428,4 @@ if st.button("Get Prediction"):
     m2.metric("R²", f"{r2:.3f}")
     m3.metric("Residual sigma", f"{sigma:.2f}")
 
-    st.caption("Data: NSEpy for NSE (EOD) and Yahoo Finance fallback. NSEpy provides OHLCV/VWAP/delivery and index/VIX series; some symbols may require lowercase with NSEpy, and derivatives can have zeros on illiquid days as noted in docs. Educational demo, not investment advice.")
+    st.caption("Educational demo. Not investment advice. Data: NSEpy for NSE and Yahoo Finance fallback. NSEpy provides OHLCV, VWAP, delivery info, index/VIX series; some symbols may require lowercase with NSEpy; earnings and sentiment via API and FinBERT.")
