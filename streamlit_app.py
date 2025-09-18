@@ -1,6 +1,5 @@
 # streamlit_app.py
 import os
-import math
 import pytz
 import requests
 import numpy as np
@@ -13,14 +12,19 @@ from sklearn.linear_model import SGDRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 
-# NSEpy import and date
+# NSEpy import
 from datetime import date as dte
-from nsepy import get_history
+try:
+    from nsepy import get_history
+    NSEPY_AVAILABLE = True
+except ImportError:
+    NSEPY_AVAILABLE = False
+    st.warning("NSEpy not available. Using yfinance only.")
 
 # ===============================
 # Configuration & Globals
 # ===============================
-st.set_page_config(page_title="NSE/BSE Expert Predictor (Fixed MultiIndex Fix)", layout="wide")
+st.set_page_config(page_title="NSE/BSE Stock Predictor with Debug", layout="wide")
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 FINBERT_MODEL = os.environ.get("FINBERT_MODEL", "ProsusAI/finbert")
 EARNINGS_API_URL = os.environ.get("EARNINGS_API_URL", "https://api.api-ninjas.com/v1/earningscalendar")
@@ -28,17 +32,16 @@ EARNINGS_API_KEY = os.environ.get("EARNINGS_API_KEY", "")
 
 @st.cache_resource(show_spinner=False)
 def get_finbert():
-    return pipeline("sentiment-analysis", model=FINBERT_MODEL)
-
-def nse_hours(now=None):
-    now = now or datetime.now(INDIA_TZ)
-    open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return open_t, close_t
+    try:
+        return pipeline("sentiment-analysis", model=FINBERT_MODEL)
+    except Exception as e:
+        st.warning(f"FinBERT not available: {e}")
+        return None
 
 def is_market_open_now():
     now = datetime.now(INDIA_TZ)
-    open_t, close_t = nse_hours(now)
+    open_t = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return now.weekday() < 5 and (now >= open_t) and (now <= close_t)
 
 def guess_tickers(user_query: str):
@@ -49,59 +52,68 @@ def guess_tickers(user_query: str):
 
 def resolve_valid_ticker(user_query: str):
     candidates = guess_tickers(user_query)
-    for t in candidates:
-        sym_clean = t.replace(".NS","").replace(".BO","")
-        try:
-            df = get_history(symbol=sym_clean.lower(), start=dte(2024,1,1), end=dte(2024,2,1))
-            if df is not None and len(df.dropna()) > 0:
-                yfd = yf.download(f"{sym_clean}.NS", period="3mo", interval="1d", auto_adjust=True, progress=False)
-                if yfd is not None and len(yfd.dropna()) > 10:
-                    return f"{sym_clean}.NS"
-        except Exception:
-            pass
+    st.write("🔍 **Ticker Resolution Debug:**")
+    st.write(f"Candidates to test: {candidates}")
+    
     for t in candidates:
         try:
-            yfd = yf.download(t, period="3mo", interval="1d", auto_adjust=True, progress=False)
-            if yfd is not None and len(yfd.dropna()) > 10:
+            # Test with yfinance first as it's more reliable
+            df = yf.download(t, period="1mo", interval="1d", auto_adjust=True, progress=False)
+            if df is not None and len(df.dropna()) > 10:
+                st.write(f"✅ Resolved to: {t} (yfinance test passed)")
                 return t
-        except Exception:
-            pass
+            else:
+                st.write(f"❌ {t} - No data from yfinance")
+        except Exception as e:
+            st.write(f"❌ {t} - Error: {e}")
+    
+    st.error("Could not resolve any valid ticker")
     return None
 
-def fetch_prices_nse_first(symbol: str, start_date: date, end_date: date):
-    sym_clean = symbol.replace(".NS","").replace(".BO","")
+def fetch_prices(symbol: str, start_date: date, end_date: date):
+    st.write(f"📈 **Fetching Price Data for {symbol}**")
+    st.write(f"Period: {start_date} to {end_date}")
+    
+    # Try NSEpy first for NSE symbols
+    if NSEPY_AVAILABLE and symbol.endswith(".NS"):
+        sym_clean = symbol.replace(".NS", "")
+        try:
+            df = get_history(
+                symbol=sym_clean.upper(),
+                start=dte(start_date.year, start_date.month, start_date.day),
+                end=dte(end_date.year, end_date.month, end_date.day)
+            )
+            if df is not None and len(df) > 0:
+                df.index = pd.to_datetime(df.index)
+                st.write(f"✅ NSEpy data fetched: {len(df)} rows")
+                st.write("NSEpy sample data:")
+                st.dataframe(df.head(3))
+                return df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        except Exception as e:
+            st.write(f"⚠️ NSEpy failed: {e}, falling back to yfinance")
+    
+    # Fallback to yfinance
     try:
-        df = get_history(symbol=sym_clean.lower(),
-                         start=dte(start_date.year, start_date.month, start_date.day),
-                         end=dte(end_date.year, end_date.month, end_date.day))
+        df = yf.download(symbol, start=start_date, end=end_date, interval="1d", auto_adjust=True, progress=False)
         if df is not None and len(df) > 0:
-            out = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","VWAP":"VWAP","Volume":"Volume"})
-            out.index = pd.to_datetime(out.index)
-            cols = [c for c in ["Open","High","Low","Close","Volume"] if c in out.columns]
-            return out[cols].dropna()
-    except Exception:
-        pass
-    yf_ticker = symbol if (symbol.endswith(".NS") or symbol.endswith(".BO")) else f"{sym_clean}.NS"
-    yfd = yf.download(yf_ticker, start=start_date, end=end_date, interval="1d", auto_adjust=True, progress=False)
-    return yfd.dropna()
+            st.write(f"✅ yfinance data fetched: {len(df)} rows")
+            st.write("yfinance sample data:")
+            st.dataframe(df.head(3))
+            return df.dropna()
+        else:
+            st.error("No data returned from yfinance")
+            return pd.DataFrame()
+    except Exception as e:
+        st.error(f"yfinance failed: {e}")
+        return pd.DataFrame()
 
-def fetch_fundamentals(symbol: str):
-    t = yf.Ticker(symbol)
-    info = {}
-    try:
-        info["fast_info"] = t.fast_info
-    except Exception:
-        pass
-    try:
-        info["info"] = t.info if hasattr(t, "info") else {}
-    except Exception:
-        info["info"] = {}
-    return info
-
-def fetch_news_headlines(symbol: str, limit: int = 60):
+def fetch_news_headlines(symbol: str, limit: int = 20):
+    st.write(f"📰 **Fetching News for {symbol}**")
     try:
         t = yf.Ticker(symbol)
         news = t.news or []
+        st.write(f"Found {len(news)} news items")
+        
         items = []
         for n in news[:limit]:
             items.append({
@@ -110,16 +122,31 @@ def fetch_news_headlines(symbol: str, limit: int = 60):
                 "link": n.get("link", ""),
                 "publisher": n.get("publisher", ""),
             })
+        
+        if items:
+            st.write("Sample headlines:")
+            for i, item in enumerate(items[:3]):
+                st.write(f"{i+1}. {item['title']}")
+        
         return items
-    except Exception:
+    except Exception as e:
+        st.write(f"⚠️ News fetch failed: {e}")
         return []
 
 def score_news_finbert(headlines):
     if not headlines:
         return pd.DataFrame(columns=["pubDate","title","sentiment","score"])
+    
     pipe = get_finbert()
+    if pipe is None:
+        st.write("⚠️ FinBERT not available, skipping sentiment")
+        return pd.DataFrame(columns=["pubDate","title","sentiment","score"])
+    
+    st.write(f"🧠 **Analyzing {len(headlines)} headlines with FinBERT**")
+    
     texts = [h["title"] for h in headlines]
     outputs = pipe(texts, truncation=True)
+    
     rows = []
     for h, o in zip(headlines, outputs):
         rows.append({
@@ -128,31 +155,16 @@ def score_news_finbert(headlines):
             "sentiment": o["label"],
             "score": o["score"],
         })
-    return pd.DataFrame(rows).sort_values("pubDate")
-
-def fetch_earnings_calendar(symbol: str, limit: int = 5):
-    if not EARNINGS_API_KEY:
-        return pd.DataFrame(columns=["date","ticker","actual_eps","estimated_eps"])
-    sym_clean = symbol.replace(".NS","").replace(".BO","")
-    params = {"ticker": sym_clean, "limit": limit, "show_upcoming":"true"}
-    headers = {"X-Api-Key": EARNINGS_API_KEY}
-    try:
-        r = requests.get(EARNINGS_API_URL, params=params, headers=headers, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return pd.DataFrame(data)
-    except Exception:
-        return pd.DataFrame(columns=["date","ticker","actual_eps","estimated_eps"])
-
-def fetch_india_vix(start_date: date, end_date: date):
-    try:
-        vix = get_history(symbol="INDIAVIX", start=dte(start_date.year,start_date.month,start_date.day),
-                          end=dte(end_date.year,end_date.month,end_date.day), index=True)
-        vix = vix.rename(columns={"Close":"VIX"}).filter(["VIX"])
-        vix.index = pd.to_datetime(vix.index)
-        return vix
-    except Exception:
-        return pd.DataFrame(columns=["VIX"])
+    
+    df = pd.DataFrame(rows).sort_values("pubDate")
+    st.write(f"✅ Sentiment analysis complete")
+    
+    # Show sentiment summary
+    sentiment_counts = df['sentiment'].value_counts()
+    st.write("Sentiment distribution:")
+    st.write(sentiment_counts)
+    
+    return df
 
 def compute_rsi(series, period=14):
     delta = series.diff()
@@ -161,7 +173,9 @@ def compute_rsi(series, period=14):
     rs = up / (down + 1e-12)
     return 100 - (100 / (1 + rs))
 
-def build_features(px: pd.DataFrame, vix: pd.DataFrame):
+def build_features(px: pd.DataFrame):
+    st.write("🔧 **Building Technical Features**")
+    
     d = px.copy()
     d["ret_1"] = d["Close"].pct_change()
     d["ret_5"] = d["Close"].pct_change(5)
@@ -169,279 +183,335 @@ def build_features(px: pd.DataFrame, vix: pd.DataFrame):
     d["ma_20"] = d["Close"].rolling(20).mean()
     d["ma_ratio"] = d["ma_5"] / d["ma_20"]
     d["rsi_14"] = compute_rsi(d["Close"], 14)
-    if vix is not None and "VIX" in vix.columns and len(vix) > 0:
-        d = d.join(vix, how="left")
-        d["VIX"] = d["VIX"].fillna(method="ffill").fillna(d["VIX"].median() if len(d["VIX"].dropna()) > 0 else 0)
-    else:
-        d["VIX"] = 0.0
-    return d.dropna()
+    
+    # Add VIX placeholder
+    d["VIX"] = 20.0  # Default VIX value
+    
+    result = d.dropna()
+    st.write(f"✅ Features built: {len(result)} rows, {len(result.columns)} columns")
+    st.write("Feature sample:")
+    st.dataframe(result[["Close", "ret_1", "ma_ratio", "rsi_14"]].tail(3))
+    
+    return result
 
 def aggregate_sentiment(sent_df: pd.DataFrame):
     if sent_df is None or len(sent_df) == 0:
-        return pd.DataFrame(columns=["date","sent_mean","sent_count","sent_pos","sent_neg"])
+        st.write("⚠️ No sentiment data to aggregate")
+        return pd.DataFrame(columns=["sent_mean","sent_count","sent_pos","sent_neg"])
+    
+    st.write(f"📊 **Aggregating Sentiment Data**")
+    
     df = sent_df.copy()
     df["date"] = df["pubDate"].dt.floor("1D")
+    
     label_to_sign = {"positive": 1, "negative": -1, "neutral": 0}
     df["signed"] = df["sentiment"].str.lower().map(label_to_sign).fillna(0) * df["score"]
+    
     agg = df.groupby("date").agg(
         sent_pos=("signed", lambda s: (s[s > 0]).sum()),
         sent_neg=("signed", lambda s: (s[s < 0]).sum()),
         sent_mean=("signed", "mean"),
         sent_count=("signed", "count"),
     ).reset_index()
-    # FIX: Deduplicate index for joining
+    
     agg = agg.drop_duplicates(subset=["date"]).set_index("date")
     agg.index = pd.to_datetime(agg.index)
+    
+    st.write(f"✅ Sentiment aggregated to {len(agg)} daily records")
+    if len(agg) > 0:
+        st.write("Sentiment sample:")
+        st.dataframe(agg.tail(3))
+    
     return agg
 
-def earnings_days_feature(ev: pd.DataFrame, price_index: pd.DatetimeIndex):
-    if ev is None or len(ev) == 0:
-        return pd.Series(0, index=price_index, name="days_to_earnings")
-    events = ev.copy()
-    if "date" in events.columns:
-        events["date"] = pd.to_datetime(events["date"], errors="coerce")
-    next_dates = events["date"].dropna().sort_values().values
-    if len(next_dates) == 0:
-        return pd.Series(0, index=price_index, name="days_to_earnings")
-    days = []
-    for d in price_index:
-        if (next_dates > np.datetime64(d)).any():
-            nd = next_dates[next_dates > np.datetime64(d)][0]
-            days.append((pd.Timestamp(nd) - pd.Timestamp(d)).days)
-        else:
-            days.append(0)
-    return pd.Series(days, index=price_index, name="days_to_earnings")
-
-def make_dataset(px: pd.DataFrame, sent_daily: pd.DataFrame, earn_df: pd.DataFrame, vix: pd.DataFrame, horizon_days: int):
-    tech = build_features(px, vix)
-    # Fix MultiIndex if present
-    if isinstance(tech.index, pd.MultiIndex):
-        idx_names = tech.index.names
-        date_level = None
-        # Find 'Date' index level if present
-        if 'Date' in idx_names:
-            date_level = idx_names.index('Date')
-            # keep only 'Date' level
-            tech = tech.reset_index(level=[name for name in idx_names if name != 'Date'], drop=True)
-        else:
-            # Fallback: keep only first level
-            tech = tech.reset_index(level=list(range(1, len(tech.index.levels))), drop=True)
-
+def make_dataset(px: pd.DataFrame, sent_daily: pd.DataFrame, horizon_days: int):
+    st.write(f"🏗️ **Building Dataset for {horizon_days}-day horizon**")
+    
+    tech = build_features(px)
+    
     if len(tech) == 0:
+        st.error("No technical features available")
         return None, None, None, None
-
-    if sent_daily is not None:
+    
+    # Handle sentiment data joining
+    df = tech.copy()
+    
+    if sent_daily is not None and len(sent_daily) > 0:
+        # Ensure no duplicates and proper datetime index
         sent_daily = sent_daily[~sent_daily.index.duplicated(keep='first')]
         sent_daily = sent_daily.loc[~sent_daily.index.isnull()]
+        
+        # Join with sentiment data
+        df = df.join(sent_daily[["sent_mean", "sent_count", "sent_pos", "sent_neg"]], how="left")
+        st.write(f"✅ Joined with sentiment data")
     else:
-        sent_daily = pd.DataFrame(columns=["sent_mean", "sent_count", "sent_pos", "sent_neg"])
-
-    df = tech.join(sent_daily[["sent_mean", "sent_count", "sent_pos", "sent_neg"]] if sent_daily is not None else None, how="left")
-    df["days_to_earnings"] = earnings_days_feature(earn_df, df.index)
-    df[["sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]] = \
-        df[["sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]].fillna(0)
-
-    y = df["Close"].shift(-horizon_days)
-    feature_cols = ["ret_1","ret_5","ma_5","ma_20","ma_ratio","rsi_14","VIX","sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]
-    out = pd.concat([df[feature_cols], y.rename("y")], axis=1).dropna()
-    if len(out) == 0:
+        # Create empty sentiment columns
+        for col in ["sent_mean", "sent_count", "sent_pos", "sent_neg"]:
+            df[col] = 0.0
+        st.write("⚠️ No sentiment data available, using zeros")
+    
+    # Add earnings placeholder
+    df["days_to_earnings"] = 0.0
+    
+    # Fill NaN values
+    sentiment_cols = ["sent_mean", "sent_count", "sent_pos", "sent_neg", "days_to_earnings"]
+    df[sentiment_cols] = df[sentiment_cols].fillna(0)
+    
+    # Create target variable
+    df["target"] = df["Close"].shift(-horizon_days)
+    
+    feature_cols = ["ret_1", "ret_5", "ma_5", "ma_20", "ma_ratio", "rsi_14", "VIX", 
+                    "sent_mean", "sent_count", "sent_pos", "sent_neg", "days_to_earnings"]
+    
+    # Create final dataset
+    final_df = df[feature_cols + ["target"]].dropna()
+    
+    if len(final_df) == 0:
+        st.error("No complete records after joining and cleaning")
         return None, None, None, None
-    X = out.drop(columns=["y"]).values
-    y = out["y"].values
-    idx = out.index
+    
+    X = final_df[feature_cols].values
+    y = final_df["target"].values
+    idx = final_df.index
+    
+    st.write(f"✅ Dataset created: {len(X)} samples, {len(feature_cols)} features")
+    st.write(f"Target range: {y.min():.2f} to {y.max():.2f}")
+    
     return X, y, idx, feature_cols
 
-def train_and_predict(px: pd.DataFrame, sent_daily: pd.DataFrame, earn_df: pd.DataFrame, vix: pd.DataFrame, horizon_days: int):
-    X, y, idx, cols = make_dataset(px, sent_daily, earn_df, vix, horizon_days)
-    if X is None or len(y) < 60:
+def train_and_predict(px: pd.DataFrame, sent_daily: pd.DataFrame, horizon_days: int):
+    st.write(f"🤖 **Training Model**")
+    
+    X, y, idx, cols = make_dataset(px, sent_daily, horizon_days)
+    
+    if X is None or len(y) < 30:
+        st.error(f"Insufficient data for training. Need at least 30 samples, got {len(y) if y is not None else 0}")
         return None
+    
+    # Split data
     split = int(0.8 * len(y))
-    Xtr, Xte = X[:split], X[split:]
-    ytr, yte = y[:split], y[split:]
+    X_train, X_test = X[:split], X[split:]
+    y_train, y_test = y[:split], y[split:]
+    
+    st.write(f"Train samples: {len(X_train)}, Test samples: {len(X_test)}")
+    
+    # Train model
     scaler = StandardScaler()
     model = SGDRegressor(loss="squared_error", penalty="l2", alpha=1e-4, random_state=42)
-    Xtr_b = scaler.fit_transform(Xtr)
-    model.partial_fit(Xtr_b, ytr)
-    yhat_te = model.predict(scaler.transform(Xte))
-    mae = mean_absolute_error(yte, yhat_te)
-    r2 = r2_score(yte, yhat_te)
-    resid = yte - yhat_te
-    sigma = np.std(resid, ddof=1) if len(resid) > 1 else 0.0
-    yhat_all = model.predict(scaler.transform(X))
-    y_next = yhat_all[-1]
+    
+    X_train_scaled = scaler.fit_transform(X_train)
+    model.partial_fit(X_train_scaled, y_train)
+    
+    # Evaluate
+    X_test_scaled = scaler.transform(X_test)
+    y_pred = model.predict(X_test_scaled)
+    
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    sigma = np.std(y_test - y_pred, ddof=1)
+    
+    st.write(f"✅ Model trained successfully")
+    st.write(f"MAE: {mae:.2f}, R²: {r2:.3f}, Sigma: {sigma:.2f}")
+    
+    # Make final prediction
+    X_all_scaled = scaler.transform(X)
+    y_pred_all = model.predict(X_all_scaled)
+    next_pred = y_pred_all[-1]
+    
     return {
-        "pred": y_next,
+        "pred": next_pred,
         "sigma": sigma,
         "last_close": float(px["Close"].iloc[-1]),
         "mae": mae,
         "r2": r2,
-        "features_tail": pd.DataFrame(X[-1:, :], columns=cols, index=[idx[-1]])
+        "feature_importance": dict(zip(cols, model.coef_)),
+        "n_samples": len(X)
     }
 
-def action_from_prediction(last_close: float, pred_price: float, sigma: float, sentiment_row: pd.Series, days_to_earn: float, horizon_label: str):
+def generate_trading_signal(last_close: float, pred_price: float, sigma: float, horizon_label: str):
+    st.write(f"🎯 **Generating Trading Signal**")
+    
+    # Calculate expected move
     exp_move = (pred_price - last_close) / last_close if last_close > 0 else 0.0
-    sent_mean = float(sentiment_row.get("sent_mean", 0.0)) if sentiment_row is not None else 0.0
-    sent_weight = 1.0 + 0.5 * np.tanh(2.0 * sent_mean)
-    earn_penalty = 0.7 if (days_to_earn is not None and days_to_earn <= 3 and days_to_earn >= 0) else 1.0
-    score = exp_move * sent_weight * earn_penalty
-    band = 0.002 if horizon_label == "INTRADAY" else 0.005
-    if score > band:
+    
+    # Define thresholds based on horizon
+    if horizon_label == "INTRADAY":
+        buy_threshold = 0.01  # 1%
+        sell_threshold = -0.01
+    elif horizon_label == "SHORT":
+        buy_threshold = 0.02  # 2%
+        sell_threshold = -0.02
+    else:  # LONG
+        buy_threshold = 0.05  # 5%
+        sell_threshold = -0.05
+    
+    # Generate signal
+    if exp_move > buy_threshold:
         action = "BUY"
-    elif score < -band:
-        action = "SELL"
+        confidence = min(1.0, abs(exp_move) / buy_threshold)
+    elif exp_move < sell_threshold:
+        action = "SELL" 
+        confidence = min(1.0, abs(exp_move) / abs(sell_threshold))
     else:
         action = "HOLD"
-    if sigma and sigma > 0:
-        vol_pct = min(0.03, max(0.005, sigma / last_close))
+        confidence = 0.5
+    
+    # Calculate stop loss
+    if sigma > 0:
+        stop_pct = max(0.01, min(0.05, 2 * sigma / last_close))
     else:
-        vol_pct = 0.01 if horizon_label == "INTRADAY" else (0.02 if horizon_label == "SHORT" else 0.04)
+        stop_pct = 0.02  # 2% default
+    
     if action == "BUY":
         entry = last_close
-        stoploss = entry * (1 - vol_pct)
+        stoploss = entry * (1 - stop_pct)
         target = pred_price
-        exp_pct = (target - entry) / entry
     elif action == "SELL":
         entry = last_close
-        stoploss = entry * (1 + vol_pct)
+        stoploss = entry * (1 + stop_pct)
         target = pred_price
-        exp_pct = (entry - target) / entry
     else:
         entry = last_close
         stoploss = None
         target = pred_price
-        exp_pct = abs((target - entry) / entry) if target else 0.0
-    exp_pct_clipped = float(np.clip(exp_pct, -0.2, 0.2))
-    direction = "UP" if exp_pct_clipped > 0.002 else ("DOWN" if exp_pct_clipped < -0.002 else "NEUTRAL")
-    return action, entry, stoploss, target, exp_pct_clipped, direction
+    
+    exp_pct = exp_move * 100
+    direction = "UP" if exp_pct > 0.5 else ("DOWN" if exp_pct < -0.5 else "NEUTRAL")
+    
+    st.write(f"Signal: {action}, Expected move: {exp_pct:.2f}%, Confidence: {confidence:.2f}")
+    
+    return action, entry, stoploss, target, exp_pct, direction, confidence
 
-def position_size_15k(entry_price: float, stoploss_price: float, max_capital_inr: float = 15000.0, risk_pct: float = 0.01):
-    max_risk = max_capital_inr * risk_pct
-    if entry_price is None or entry_price <= 0:
-        return 1, 0.0, max_risk
+def calculate_position_size(entry_price: float, stoploss_price: float, max_capital: float = 15000.0):
+    if entry_price <= 0:
+        return 0, 0
+    
     if stoploss_price is None or stoploss_price <= 0:
-        qty = max(1, int(max_capital_inr // entry_price))
-        total_cost = qty * entry_price
-        return qty, min(max_capital_inr, total_cost), max_risk
-    risk_per_share = abs(entry_price - stoploss_price)
-    if risk_per_share <= 0:
-        qty = max(1, int(max_capital_inr // entry_price))
-        return qty, min(max_capital_inr, qty * entry_price), max_risk
-    qty = int(max_risk // risk_per_share)
-    qty = 1 if qty < 1 else qty
+        # No stop loss, use fixed allocation
+        qty = int(max_capital * 0.1 / entry_price)  # Use 10% of capital
+    else:
+        # Risk-based position sizing (1% risk)
+        risk_per_share = abs(entry_price - stoploss_price)
+        max_risk = max_capital * 0.01  # 1% of capital at risk
+        qty = int(max_risk / risk_per_share) if risk_per_share > 0 else 0
+    
+    qty = max(1, min(qty, int(max_capital / entry_price)))  # At least 1 share, max what we can afford
     total_cost = qty * entry_price
-    if total_cost > max_capital_inr:
-        qty = max(1, int(max_capital_inr // entry_price))
-        total_cost = qty * entry_price
-    return qty, total_cost, max_risk
+    
+    return qty, total_cost
 
 # ===============================
 # Streamlit UI
 # ===============================
-st.title("NSE/BSE Expert Trade Predictor — Fixed MultiIndex Fix")
+st.title("🚀 NSE/BSE Stock Predictor with Step-by-Step Debug")
 
-c0, c1, c2 = st.columns([2,1,1])
-with c0:
-    user_query = st.text_input("Enter NSE/BSE stock or company name (e.g., RELIANCE, TCS, INFY, HDFCBANK)", value="RELIANCE")
-with c1:
-    horizon_label = st.selectbox("TERM", options=["INTRADAY","SHORT","LONG"], index=0)
-with c2:
-    lookback_days = st.number_input("Lookback days", min_value=90, max_value=1800, value=365, step=5)
+st.sidebar.header("Configuration")
+user_query = st.sidebar.text_input("Stock Symbol/Name", value="RELIANCE")
+horizon_label = st.sidebar.selectbox("Trading Horizon", ["INTRADAY", "SHORT", "LONG"])
+lookback_days = st.sidebar.slider("Lookback Days", 90, 730, 365)
 
-if st.button("Get Prediction"):
+# Map horizon to days
+horizon_map = {"INTRADAY": 1, "SHORT": 5, "LONG": 20}
+horizon_days = horizon_map[horizon_label]
+
+st.write(f"**Analysis for:** {user_query}")
+st.write(f"**Horizon:** {horizon_label} ({horizon_days} days)")
+st.write(f"**Market Open:** {'YES' if is_market_open_now() else 'NO'}")
+
+if st.button("🔍 Analyze Stock", type="primary"):
+    # Step 1: Resolve ticker
     ticker = resolve_valid_ticker(user_query)
-    if ticker is None:
-        st.error("Could not resolve a valid NSE/BSE ticker. Try exact symbol (e.g., RELIANCE.NS) or company name.")
+    if not ticker:
         st.stop()
-
-    st.write(f"Resolved Ticker: {ticker}")
-    horizon_days = 1 if horizon_label == "INTRADAY" else (5 if horizon_label == "SHORT" else 20)
+    
+    # Step 2: Fetch price data
     end_date = date.today()
-    start_date = end_date - timedelta(days=int(lookback_days))
-
-    with st.spinner("Fetching market data, VIX, fundamentals, headlines..."):
-        px = fetch_prices_nse_first(ticker, start_date, end_date + timedelta(days=1))
-        vix = fetch_india_vix(start_date, end_date + timedelta(days=1))
-        fnd = fetch_fundamentals(ticker)
-        headlines = fetch_news_headlines(ticker, limit=80)
-        sent_df = score_news_finbert(headlines)
-        earn_df = fetch_earnings_calendar(ticker, limit=5)
-
-    st.subheader("Close Price")
-    st.line_chart(px["Close"])
-
-    st.subheader("Recent headlines + sentiment")
-    st.dataframe(sent_df.sort_values("pubDate", ascending=False).head(12))
-
-    st.subheader("Upcoming earnings (if any)")
-    st.dataframe(earn_df.head(5))
-
-    sent_daily = aggregate_sentiment(sent_df)
-    pred = train_and_predict(px, sent_daily, earn_df, vix, horizon_days=horizon_days)
-    if pred is None:
-        st.error("Not enough data to build a prediction. Try increasing lookback days.")
+    start_date = end_date - timedelta(days=lookback_days)
+    px = fetch_prices(ticker, start_date, end_date)
+    
+    if px.empty:
+        st.error("No price data available")
         st.stop()
-
-    last_close = float(pred["last_close"])
-    pred_price = float(pred["pred"])
-    sigma = float(pred["sigma"])
-    mae = float(pred["mae"])
-    r2 = float(pred["r2"])
-
-    latest_date = sent_daily.index.max() if sent_daily is not None and len(sent_daily) > 0 else None
-    latest_sent_row = sent_daily.loc[latest_date] if latest_date is not None else None
-    earn_days_series = earnings_days_feature(earn_df, px.index)
-    days_to_earn = float(earn_days_series.iloc[-1]) if earn_days_series is not None and len(earn_days_series) > 0 else None
-
-    action, entry, stoploss, target, exp_pct, direction = action_from_prediction(
-        last_close, pred_price, sigma, latest_sent_row, days_to_earn, horizon_label
+    
+    # Step 3: Fetch and analyze news
+    headlines = fetch_news_headlines(ticker, limit=20)
+    sent_df = score_news_finbert(headlines)
+    sent_daily = aggregate_sentiment(sent_df)
+    
+    # Step 4: Train model and predict
+    prediction = train_and_predict(px, sent_daily, horizon_days)
+    
+    if prediction is None:
+        st.error("Could not generate prediction")
+        st.stop()
+    
+    # Step 5: Generate trading signal
+    action, entry, stoploss, target, exp_pct, direction, confidence = generate_trading_signal(
+        prediction["last_close"], prediction["pred"], prediction["sigma"], horizon_label
     )
-    qty, total_cap, max_risk = position_size_15k(entry_price=entry, stoploss_price=stoploss, max_capital_inr=15000.0, risk_pct=0.01)
-
-    st.subheader("Expert-style Recommendation")
-    st.write(f"STOCK_NAME (COMPANY_NAME): {ticker}")
-    st.write(f"DATE: {datetime.now(INDIA_TZ).strftime('%Y-%m-%d %H:%M %Z')}")
-    st.write(f"TERM: {horizon_label}")
-    st.write(f"MARKET IS CURRENTLY OPEN? {'YES' if is_market_open_now() else 'NO'}")
-    st.write(f"ACTION: {action}")
-    st.write(f"PRICE: {'{:.2f}'.format(entry)}")
-    if stoploss is not None:
-        st.write(f"STOPLOSS: {'{:.2f}'.format(stoploss)}")
-    else:
-        st.write("STOPLOSS: N/A (HOLD)")
-    st.write(f"PREDICTION_DATE (+{horizon_days}D): {(datetime.now(INDIA_TZ) + timedelta(days=horizon_days)).strftime('%Y-%m-%d')}")
-    st.write(f"PREDICTED PRICE: {'{:.2f}'.format(target)}")
-    st.write(f"HOW MUCH % WILL GO {direction}: {exp_pct * 100:.2f}%")
-    st.write(f"HOW MANY QTY TO {'BUY' if action != 'SELL' else 'SELL'} (<= ₹15,000): {qty} (approx capital ₹{total_cap:,.0f}, max risk/trade ₹{max_risk:,.0f})")
-
+    
+    # Step 6: Calculate position size
+    qty, total_cost = calculate_position_size(entry, stoploss)
+    
+    # Display results
+    st.success("✅ Analysis Complete!")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("📊 Prediction Results")
+        st.metric("Current Price", f"₹{entry:.2f}")
+        st.metric("Predicted Price", f"₹{target:.2f}")
+        st.metric("Expected Move", f"{exp_pct:+.2f}%")
+        st.metric("Direction", direction)
+        
+    with col2:
+        st.subheader("💼 Trading Recommendation")
+        st.metric("Action", action)
+        if stoploss:
+            st.metric("Stop Loss", f"₹{stoploss:.2f}")
+        st.metric("Quantity", f"{qty} shares")
+        st.metric("Investment", f"₹{total_cost:,.0f}")
+    
+    # Model performance
+    with st.expander("🤖 Model Performance"):
+        col1, col2, col3 = st.columns(3)
+        col1.metric("MAE", f"₹{prediction['mae']:.2f}")
+        col2.metric("R² Score", f"{prediction['r2']:.3f}")
+        col3.metric("Samples Used", prediction['n_samples'])
+    
+    # Charts
+    st.subheader("📈 Price Chart")
+    st.line_chart(px["Close"])
+    
+    if len(sent_df) > 0:
+        st.subheader("📰 Recent News & Sentiment")
+        st.dataframe(sent_df.head(10))
+    
+    # Explanation
+    st.subheader("🎯 Why This Recommendation?")
     reasons = []
-    feats = pred["features_tail"].iloc[0]
-    if feats.get("ma_ratio", 1.0) > 1.0:
-        reasons.append("Short-term trend above 20-day average (bullish bias).")
-    if feats.get("rsi_14", 50) < 35:
-        reasons.append("RSI indicates potential oversold rebound.")
-    if feats.get("rsi_14", 50) > 65:
-        reasons.append("RSI shows overbought conditions; pullback risk.")
-    if latest_sent_row is not None:
-        sm = latest_sent_row.get("sent_mean", 0.0)
-        sc = latest_sent_row.get("sent_count", 0)
-        if sm > 0.02 and sc >= 2:
-            reasons.append("Recent news sentiment is net positive.")
-        elif sm < -0.02 and sc >= 2:
-            reasons.append("Recent news sentiment is net negative.")
-    if days_to_earn is not None and 0 <= days_to_earn <= 3:
-        reasons.append("Earnings nearby; confidence reduced and stop widened.")
-    if vix is not None and len(vix) > 0 and float(vix.iloc[-1].get("VIX", 0)) > (vix["VIX"].median() if "VIX" in vix.columns and len(vix["VIX"].dropna()) > 0 else 0):
-        reasons.append("Elevated India VIX indicates higher market volatility.")
+    
+    if abs(exp_pct) > 2:
+        reasons.append(f"Model predicts {abs(exp_pct):.1f}% price movement")
+    if prediction['r2'] > 0.1:
+        reasons.append(f"Model shows decent predictive power (R² = {prediction['r2']:.2f})")
+    if len(sent_df) > 0:
+        avg_sentiment = sent_df['score'].mean()
+        if sent_df['sentiment'].mode().iloc[0] == 'positive':
+            reasons.append("Recent news sentiment is positive")
+        elif sent_df['sentiment'].mode().iloc[0] == 'negative':
+            reasons.append("Recent news sentiment is negative")
+    
     if not reasons:
-        reasons.append("Model-based projection blended with sentiment, VIX, and earnings proximity.")
-    st.subheader("EXPLAIN: WHY BUY/SELL/HOLD")
-    for r in reasons:
-        st.write(f"- {r}")
+        reasons.append("Based on technical analysis and model prediction")
+    
+    for reason in reasons:
+        st.write(f"• {reason}")
+    
+    st.warning("⚠️ This is for educational purposes only. Not financial advice. Trade at your own risk.")
 
-    st.subheader("Backtest-style Metrics (Holdout)")
-    m1, m2, m3 = st.columns(3)
-    m1.metric("MAE", f"{mae:.2f}")
-    m2.metric("R²", f"{r2:.3f}")
-    m3.metric("Residual sigma", f"{sigma:.2f}")
-
-    st.caption("Educational demo. Not investment advice. Data: NSEpy for NSE and Yahoo Finance fallback. NSEpy provides OHLCV, VWAP, delivery info, index/VIX series; some symbols may require lowercase with NSEpy; earnings and sentiment via API and FinBERT.")
+st.sidebar.markdown("---")
+st.sidebar.markdown("**Debug Info:**")
+st.sidebar.markdown(f"NSEpy Available: {NSEPY_AVAILABLE}")
+st.sidebar.markdown(f"FinBERT Available: {get_finbert() is not None}")
