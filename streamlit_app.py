@@ -20,7 +20,7 @@ from nsepy import get_history
 # ===============================
 # Configuration & Globals
 # ===============================
-st.set_page_config(page_title="NSE/BSE Expert Predictor (Fixed Merge)", layout="wide")
+st.set_page_config(page_title="NSE/BSE Expert Predictor (Fixed MultiIndex Fix)", layout="wide")
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 FINBERT_MODEL = os.environ.get("FINBERT_MODEL", "ProsusAI/finbert")
 EARNINGS_API_URL = os.environ.get("EARNINGS_API_URL", "https://api.api-ninjas.com/v1/earningscalendar")
@@ -214,17 +214,33 @@ def earnings_days_feature(ev: pd.DataFrame, price_index: pd.DatetimeIndex):
 
 def make_dataset(px: pd.DataFrame, sent_daily: pd.DataFrame, earn_df: pd.DataFrame, vix: pd.DataFrame, horizon_days: int):
     tech = build_features(px, vix)
+    # Fix MultiIndex if present
+    if isinstance(tech.index, pd.MultiIndex):
+        idx_names = tech.index.names
+        date_level = None
+        # Find 'Date' index level if present
+        if 'Date' in idx_names:
+            date_level = idx_names.index('Date')
+            # keep only 'Date' level
+            tech = tech.reset_index(level=[name for name in idx_names if name != 'Date'], drop=True)
+        else:
+            # Fallback: keep only first level
+            tech = tech.reset_index(level=list(range(1, len(tech.index.levels))), drop=True)
+
     if len(tech) == 0:
         return None, None, None, None
+
     if sent_daily is not None:
         sent_daily = sent_daily[~sent_daily.index.duplicated(keep='first')]
         sent_daily = sent_daily.loc[~sent_daily.index.isnull()]
     else:
         sent_daily = pd.DataFrame(columns=["sent_mean", "sent_count", "sent_pos", "sent_neg"])
+
     df = tech.join(sent_daily[["sent_mean", "sent_count", "sent_pos", "sent_neg"]] if sent_daily is not None else None, how="left")
     df["days_to_earnings"] = earnings_days_feature(earn_df, df.index)
     df[["sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]] = \
         df[["sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]].fillna(0)
+
     y = df["Close"].shift(-horizon_days)
     feature_cols = ["ret_1","ret_5","ma_5","ma_20","ma_ratio","rsi_14","VIX","sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]
     out = pd.concat([df[feature_cols], y.rename("y")], axis=1).dropna()
@@ -319,9 +335,9 @@ def position_size_15k(entry_price: float, stoploss_price: float, max_capital_inr
     return qty, total_cost, max_risk
 
 # ===============================
-# UI
+# Streamlit UI
 # ===============================
-st.title("NSE/BSE Expert Trade Predictor — Fixed Merge Error")
+st.title("NSE/BSE Expert Trade Predictor — Fixed MultiIndex Fix")
 
 c0, c1, c2 = st.columns([2,1,1])
 with c0:
@@ -371,10 +387,10 @@ if st.button("Get Prediction"):
     mae = float(pred["mae"])
     r2 = float(pred["r2"])
 
-    latest_date = sent_daily.index.max() if sent_daily is not None and len(sent_daily)>0 else None
+    latest_date = sent_daily.index.max() if sent_daily is not None and len(sent_daily) > 0 else None
     latest_sent_row = sent_daily.loc[latest_date] if latest_date is not None else None
     earn_days_series = earnings_days_feature(earn_df, px.index)
-    days_to_earn = float(earn_days_series.iloc[-1]) if (earn_days_series is not None and len(earn_days_series)>0) else None
+    days_to_earn = float(earn_days_series.iloc[-1]) if earn_days_series is not None and len(earn_days_series) > 0 else None
 
     action, entry, stoploss, target, exp_pct, direction = action_from_prediction(
         last_close, pred_price, sigma, latest_sent_row, days_to_earn, horizon_label
@@ -392,10 +408,10 @@ if st.button("Get Prediction"):
         st.write(f"STOPLOSS: {'{:.2f}'.format(stoploss)}")
     else:
         st.write("STOPLOSS: N/A (HOLD)")
-    st.write(f"PREDICTION_DATE (+{horizon_days}D): {(datetime.now(INDIA_TZ)+timedelta(days=horizon_days)).strftime('%Y-%m-%d')}")
+    st.write(f"PREDICTION_DATE (+{horizon_days}D): {(datetime.now(INDIA_TZ) + timedelta(days=horizon_days)).strftime('%Y-%m-%d')}")
     st.write(f"PREDICTED PRICE: {'{:.2f}'.format(target)}")
-    st.write(f"HOW MUCH % WILL GO {direction}: {exp_pct*100:.2f}%")
-    st.write(f"HOW MANY QTY TO {'BUY' if action!='SELL' else 'SELL'} (<= ₹15,000): {qty} (approx capital ₹{total_cap:,.0f}, max risk/trade ₹{max_risk:,.0f})")
+    st.write(f"HOW MUCH % WILL GO {direction}: {exp_pct * 100:.2f}%")
+    st.write(f"HOW MANY QTY TO {'BUY' if action != 'SELL' else 'SELL'} (<= ₹15,000): {qty} (approx capital ₹{total_cap:,.0f}, max risk/trade ₹{max_risk:,.0f})")
 
     reasons = []
     feats = pred["features_tail"].iloc[0]
