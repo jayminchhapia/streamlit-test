@@ -1,17 +1,16 @@
 import os
 import pytz
-import requests
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from transformers import pipeline
 from sklearn.linear_model import SGDRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 
-st.set_page_config(page_title="NSE/BSE Predictor – robust merge", layout="wide")
+st.set_page_config(page_title="NSE/BSE Predictor — robust merges & headlines", layout="wide")
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 FINBERT_MODEL = os.environ.get("FINBERT_MODEL", "ProsusAI/finbert")
 
@@ -30,82 +29,101 @@ def is_market_open_now():
 
 def guess_tickers(q: str):
     q = q.strip().upper()
-    if q.endswith(".NS") or q.endswith(".BO"):
-        return [q]
-    return [f"{q}.NS", f"{q}.BO"]
+    return [q] if (q.endswith(".NS") or q.endswith(".BO")) else [f"{q}.NS", f"{q}.BO"]
 
 def resolve_valid_ticker(user_query: str):
     candidates = guess_tickers(user_query)
-    st.write("🔍 Ticker resolution candidates:", candidates)
+    st.write("Candidates:", candidates)
     for t in candidates:
         try:
             df = yf.download(t, period="1mo", interval="1d", auto_adjust=True, progress=False)
             if df is not None and len(df.dropna()) > 10:
-                st.write(f"✅ Resolved to: {t}")
+                st.write(f"Resolved: {t}")
                 return t
         except Exception as e:
-            st.write(f"❌ {t}: {e}")
-    st.error("Could not resolve any valid ticker")
+            st.write(f"{t} error: {e}")
+    st.error("Could not resolve ticker")
     return None
 
 def fetch_prices_yf(ticker: str, start_date: date, end_date: date):
-    st.write(f"📈 Fetching yfinance OHLCV for {ticker} from {start_date} to {end_date}")
     df = yf.download(ticker, start=start_date, end=end_date, interval="1d", auto_adjust=True, progress=False)
-    if df is None or len(df)==0:
-        st.error("yfinance returned no data")
+    if df is None or len(df) == 0:
+        st.error("No yfinance data")
         return pd.DataFrame()
     if "Close" not in df.columns and "Adj Close" in df.columns:
         df["Close"] = df["Adj Close"]
     df = df[["Open","High","Low","Close","Volume"]].dropna()
-    df.index = pd.to_datetime(df.index)
-    st.write(f"✅ yfinance rows: {len(df)}")
-    st.dataframe(df.head(3))
+    # Ensure naive datetime64[ns]
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    st.write(f"yfinance rows: {len(df)} | columns: {list(df.columns)}")
+    st.dataframe(df.head(10))
     return df
 
 def fetch_news(ticker: str, limit: int = 20):
-    st.write(f"📰 Fetching news for {ticker}")
     try:
         t = yf.Ticker(ticker)
-        news = t.news or []
-        items = []
-        for n in news[:limit]:
-            items.append({
-                "title": n.get("title", ""),
-                "pubDate": datetime.fromtimestamp(n.get("providerPublishTime", 0), tz=INDIA_TZ),
-                "link": n.get("link", ""),
-                "publisher": n.get("publisher", "")
-            })
-        st.write(f"Found {len(items)} headlines")
-        if items:
-            # Show exact 10 headlines with source
-            st.subheader("Latest headlines (title, publisher, link)")
-            for i, it in enumerate(items[:10], 1):
-                st.write(f"{i}. {it['title']} — {it['publisher']}")
-                st.write(it["link"])
-        return items
+        news_raw = t.news or []
     except Exception as e:
-        st.write(f"⚠️ News fetch failed: {e}")
-        return []
+        st.write(f"news fetch error: {e}")
+        news_raw = []
+
+    items = []
+    for n in news_raw[:limit]:
+        # Handle missing fields safely
+        title = n.get("title") or ""
+        publisher = n.get("publisher") or ""
+        link = n.get("link") or ""
+        ts = n.get("providerPublishTime")
+        # Filter invalid timestamps (None or <=0 -> skip to avoid 1970-01-01)
+        if ts is None or ts <= 0:
+            continue
+        pub_dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(INDIA_TZ)
+        items.append({"title": title, "publisher": publisher, "link": link, "pubDate": pub_dt})
+
+    st.write(f"Headlines fetched: {len(items)}")
+    # Display exact items clearly
+    if items:
+        st.subheader("Latest headlines")
+        for i, it in enumerate(items[:10], 1):
+            title = it['title'] or "(no title)"
+            pub = it['publisher'] or "(unknown)"
+            link = it['link'] or "(no link)"
+            st.write(f"{i}. {title} — {pub}")
+            if link and link != "(no link)":
+                st.write(link)
+    else:
+        st.write("No valid headlines with proper timestamps available.")
+
+    return items
 
 def score_headlines_finbert(headlines):
     if not headlines:
         return pd.DataFrame(columns=["pubDate","title","sentiment","score"])
     pipe = get_finbert()
     if pipe is None:
-        st.write("⚠️ FinBERT unavailable; skipping sentiment")
         return pd.DataFrame(columns=["pubDate","title","sentiment","score"])
-    texts = [h["title"] for h in headlines]
+    texts = [h["title"] for h in headlines if h.get("title")]
+    if not texts:
+        return pd.DataFrame(columns=["pubDate","title","sentiment","score"])
     outputs = pipe(texts, truncation=True)
     rows = []
-    for h, o in zip(headlines, outputs):
+    j = 0
+    for h in headlines:
+        title = h.get("title")
+        if not title:
+            continue
+        o = outputs[j]
+        j += 1
         rows.append({
-            "pubDate": pd.to_datetime(h["pubDate"]),
-            "title": h["title"],
-            "sentiment": o["label"],
-            "score": o["score"]
+            "pubDate": pd.to_datetime(h["pubDate"]).tz_localize(None),
+            "title": title,
+            "sentiment": o.get("label", "neutral"),
+            "score": float(o.get("score", 0.0)),
+            "publisher": h.get("publisher", "")
         })
     df = pd.DataFrame(rows).sort_values("pubDate")
     st.write("Sentiment distribution:", df["sentiment"].value_counts().to_dict())
+    st.dataframe(df.tail(10))
     return df
 
 def compute_rsi(series, period=14):
@@ -116,7 +134,6 @@ def compute_rsi(series, period=14):
     return 100 - (100 / (1 + rs))
 
 def build_technicals(px: pd.DataFrame):
-    st.write("🔧 Building technical features")
     d = px.copy()
     d["ret_1"] = d["Close"].pct_change()
     d["ret_5"] = d["Close"].pct_change(5)
@@ -124,69 +141,89 @@ def build_technicals(px: pd.DataFrame):
     d["ma_20"] = d["Close"].rolling(20).mean()
     d["ma_ratio"] = d["ma_5"] / d["ma_20"]
     d["rsi_14"] = compute_rsi(d["Close"], 14)
-    d["VIX"] = 0.0  # placeholder
+    d["VIX"] = 0.0
     d = d.dropna()
-    # Flatten index for robust merges
+    # Flatten to a Date column
     d = d.reset_index().rename(columns={"index":"Date"})
-    d["Date"] = pd.to_datetime(d["Date"]).dt.tz_localize(None)
-    st.write(f"✅ Features rows: {len(d)}")
-    st.dataframe(d[["Date","Close","ret_1","ma_ratio","rsi_14"]].tail(3))
+    d["Date"] = pd.to_datetime(d["Date"]).tz_localize(None)
+    st.write(f"Features rows: {len(d)}")
+    st.dataframe(d[["Date","Close","ret_1","ma_ratio","rsi_14"]].head(10))
     return d
 
 def aggregate_sentiment_daily(sent_df: pd.DataFrame):
-    if sent_df is None or len(sent_df)==0:
-        st.write("⚠️ No sentiment to aggregate")
+    if sent_df is None or len(sent_df) == 0:
+        st.write("No sentiment to aggregate")
         return pd.DataFrame(columns=["Date","sent_mean","sent_count","sent_pos","sent_neg"])
     df = sent_df.copy()
-    df["Date"] = df["pubDate"].dt.floor("1D").dt.tz_localize(None)
+    # Already naive datetime above; normalize to date
+    df["Date"] = pd.to_datetime(df["pubDate"]).dt.normalize()
     label_to_sign = {"positive": 1, "negative": -1, "neutral": 0}
-    df["signed"] = df["sentiment"].str.lower().map(label_to_sign).fillna(0) * df["score"]
-    agg = df.groupby("Date").agg(
-        sent_pos=("signed", lambda s: (s[s>0]).sum()),
-        sent_neg=("signed", lambda s: (s[s<0]).sum()),
-        sent_mean=("signed","mean"),
+    df["signed"] = df["sentiment"].str.lower().map(label_to_sign).fillna(0) * df["score"].fillna(0.0)
+    agg = df.groupby("Date", as_index=False).agg(
+        sent_pos=("signed", lambda s: float((s[s>0]).sum())),
+        sent_neg=("signed", lambda s: float((s[s<0]).sum())),
+        sent_mean=("signed", "mean"),
         sent_count=("signed","count")
-    ).reset_index()
+    )
+    # Ensure correct dtypes and uniqueness
+    agg["Date"] = pd.to_datetime(agg["Date"]).tz_localize(None)
     agg = agg.drop_duplicates(subset=["Date"])
-    st.write(f"✅ Sentiment daily rows: {len(agg)}")
-    st.dataframe(agg.tail(3))
+    st.write(f"Sentiment daily rows: {len(agg)}")
+    st.dataframe(agg.head(10))
     return agg
 
-def make_dataset(px: pd.DataFrame, sent_daily: pd.DataFrame, horizon_days: int):
-    st.write(f"🏗️ Building dataset (horizon={horizon_days}d)")
-    tech = build_technicals(px)  # has Date column
+def safe_merge_on_date(tech_df: pd.DataFrame, sent_daily: pd.DataFrame):
+    # Both should have a naive Date column
+    left = tech_df.copy()
+    left["Date"] = pd.to_datetime(left["Date"]).dt.normalize()
     if sent_daily is None or len(sent_daily)==0:
-        # Build empty sentiment columns
-        tech["sent_mean"] = 0.0
-        tech["sent_count"] = 0.0
-        tech["sent_pos"] = 0.0
-        tech["sent_neg"] = 0.0
-        merged = tech.copy()
-    else:
-        # Safe merge on Date column, not index
-        sent_daily = sent_daily.copy()
-        sent_daily["Date"] = pd.to_datetime(sent_daily["Date"])
-        merged = pd.merge(
-            tech, 
-            sent_daily[["Date","sent_mean","sent_count","sent_pos","sent_neg"]],
-            on="Date", how="left"
-        )
         for c in ["sent_mean","sent_count","sent_pos","sent_neg"]:
-            merged[c] = merged[c].fillna(0)
+            left[c] = 0.0
+        return left
+    right = sent_daily.copy()
+    right["Date"] = pd.to_datetime(right["Date"]).dt.normalize()
+    right = right.drop_duplicates(subset=["Date"])
+    # Safe typed columns
+    for c in ["sent_mean","sent_count","sent_pos","sent_neg"]:
+        if c in right.columns:
+            right[c] = pd.to_numeric(right[c], errors="coerce").fillna(0.0)
+        else:
+            right[c] = 0.0
+    try:
+        merged = pd.merge(left, right[["Date","sent_mean","sent_count","sent_pos","sent_neg"]],
+                          on="Date", how="left", validate="one_to_one")
+    except Exception as e:
+        st.write(f"merge failed: {e}")
+        # Fallback: align by Date via reindex
+        right_idx = right.set_index("Date")[["sent_mean","sent_count","sent_pos","sent_neg"]]
+        right_idx = right_idx[~right_idx.index.duplicated(keep="first")]
+        merged = left.set_index("Date").sort_index()
+        right_aligned = right_idx.reindex(merged.index).fillna(0.0)
+        merged = pd.concat([merged, right_aligned], axis=1).reset_index()
+        merged = merged.rename(columns={"index":"Date"})
+    # Fill NaNs after merge
+    for c in ["sent_mean","sent_count","sent_pos","sent_neg"]:
+        merged[c] = merged[c].fillna(0.0)
+    return merged
+
+def make_dataset(px: pd.DataFrame, sent_daily: pd.DataFrame, horizon_days: int):
+    tech = build_technicals(px)  # has Date col
+    merged = safe_merge_on_date(tech, sent_daily)
     # Add earnings placeholder
     merged["days_to_earnings"] = 0.0
-    # Target
+    # Sort
     merged = merged.sort_values("Date")
+    # Target
     merged["target"] = merged["Close"].shift(-horizon_days)
     feature_cols = ["ret_1","ret_5","ma_5","ma_20","ma_ratio","rsi_14","VIX","sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]
     final_df = merged[["Date"] + feature_cols + ["target"]].dropna()
-    if len(final_df)==0:
-        st.error("No samples after cleaning; increase lookback or change ticker")
+    st.write(f"Final dataset rows: {len(final_df)} | features: {len(feature_cols)}")
+    st.dataframe(final_df.head(10))
+    if len(final_df) == 0:
         return None, None, None, None
     X = final_df[feature_cols].values
     y = final_df["target"].values
     idx = final_df["Date"].values
-    st.write(f"✅ Dataset: {len(X)} samples, {len(feature_cols)} features")
     return X, y, idx, feature_cols
 
 def train_and_predict(px: pd.DataFrame, sent_daily: pd.DataFrame, horizon_days: int):
@@ -238,12 +275,12 @@ def position_size(entry: float, stop: float|None, cap: float=15000.0):
     qty = max(1, min(qty, int(cap/entry)))
     return qty, qty*entry
 
-st.title("🚀 NSE/BSE Stock Predictor — yfinance-only with robust column merges")
-st.write(f"Market open now? {'YES' if is_market_open_now() else 'NO'}")
+st.title("NSE/BSE Stock Predictor — robust merges & sources")
+st.write(f"Market open? {'YES' if is_market_open_now() else 'NO'}")
 
-user_query = st.text_input("Stock symbol or name (e.g., RELIANCE or RELIANCE.NS)", value="RELIANCE")
-horizon_label = st.selectbox("Trading Horizon", ["INTRADAY","SHORT","LONG"], index=0)
-lookback_days = st.slider("Lookback Days", 90, 730, 365)
+user_query = st.text_input("Symbol or name (e.g., RELIANCE or RELIANCE.NS)", value="RELIANCE")
+horizon_label = st.selectbox("Horizon", ["INTRADAY","SHORT","LONG"], index=0)
+lookback_days = st.slider("Lookback days", 90, 730, 365)
 
 if st.button("Analyze", type="primary"):
     ticker = resolve_valid_ticker(user_query)
@@ -260,9 +297,11 @@ if st.button("Analyze", type="primary"):
     horizon_days = {"INTRADAY":1,"SHORT":5,"LONG":20}[horizon_label]
     pred = train_and_predict(px, sent_daily, horizon_days)
     if pred is None:
-        st.error("Insufficient data for training. Increase lookback or pick another ticker.")
+        st.error("Insufficient data; increase lookback or pick a different ticker.")
         st.stop()
-    action, entry, stoploss, target, exp_pct, direction = generate_signal(pred["last_close"], pred["pred"], pred["sigma"], horizon_label)
+    action, entry, stoploss, target, exp_pct, direction = generate_signal(
+        pred["last_close"], pred["pred"], pred["sigma"], horizon_label
+    )
     qty, total = position_size(entry, stoploss)
     st.subheader("Recommendation")
     st.write(f"STOCK_NAME: {ticker}")
