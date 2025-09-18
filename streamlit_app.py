@@ -6,11 +6,11 @@ import streamlit as st
 import yfinance as yf
 from datetime import datetime, date, timedelta
 from transformers import pipeline
-from sklearn.ensemble import RandomForestRegressor  # More stable than SGD
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 
-st.set_page_config(page_title="NSE/BSE Predictor - Fixed Predictions", layout="wide")
+st.set_page_config(page_title="NSE/BSE Predictor - Working Version", layout="wide")
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 
 @st.cache_resource(show_spinner=False)
@@ -66,16 +66,18 @@ def fetch_price_data(ticker: str, start_date: date, end_date: date):
         df = df[df["Close"] > 0]  # Remove any invalid price data
         
         st.write(f"✅ Price data: {len(df)} rows")
-        st.write(f"Price range: ₹{df['Close'].min():.2f} to ₹{df['Close'].max():.2f}")
+        min_price = df['Close'].min()
+        max_price = df['Close'].max()
+        st.write(f"Price range: ₹{min_price:.2f} to ₹{max_price:.2f}")
         st.dataframe(df.head(5))
         
         return df
         
     except Exception as e:
-        st.error(f"Price fetch failed: {e}")
+        st.error(f"Price fetch failed: {str(e)}")
         return pd.DataFrame()
 
-def fetch_news_data(ticker: str, limit: int = 15):
+def fetch_news_data(ticker: str, limit: int = 10):
     st.write(f"📰 Fetching news for {ticker}")
     
     try:
@@ -112,14 +114,14 @@ def fetch_news_data(ticker: str, limit: int = 15):
         
         if valid_items:
             st.subheader("📰 Latest Headlines")
-            for i, item in enumerate(valid_items[:5], 1):  # Show only top 5
+            for i, item in enumerate(valid_items[:5], 1):
                 st.write(f"**{i}.** {item['title']}")
                 st.write(f"   📍 Source: {item['publisher']}")
         
         return valid_items
         
     except Exception as e:
-        st.write(f"⚠️ News fetch error: {e}")
+        st.write(f"⚠️ News fetch error: {str(e)}")
         return []
 
 def analyze_sentiment(headlines):
@@ -151,8 +153,15 @@ def analyze_sentiment(headlines):
         return df
         
     except Exception as e:
-        st.write(f"⚠️ Sentiment analysis failed: {e}")
+        st.write(f"⚠️ Sentiment analysis failed: {str(e)}")
         return pd.DataFrame(columns=["pubDate", "title", "sentiment", "score"])
+
+def compute_rsi(series, period=14):
+    delta = series.diff()
+    up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
+    down = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
+    rs = up / (down + 1e-8)
+    return 100 - (100 / (1 + rs))
 
 def compute_technical_indicators(price_df):
     """Compute technical indicators with proper bounds checking"""
@@ -179,13 +188,6 @@ def compute_technical_indicators(price_df):
     
     return df
 
-def compute_rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
-    down = -delta.clip(upper=0).ewm(alpha=1/period, adjust=False).mean()
-    rs = up / (down + 1e-8)
-    return 100 - (100 / (1 + rs))
-
 def create_model_dataset(price_df, sentiment_df, horizon_days):
     """Create dataset with proper target variable and feature validation"""
     st.write(f"🏗️ Creating dataset for {horizon_days}-day prediction")
@@ -195,8 +197,7 @@ def create_model_dataset(price_df, sentiment_df, horizon_days):
     
     # Add date column
     df = df.reset_index()
-    df['Date'] = pd.to_datetime(df['Date']).dt.date
-    df['Date'] = pd.to_datetime(df['Date'])
+    df['Date'] = pd.to_datetime(df.index.values if 'Date' not in df.columns else df['Date'])
     
     # Add sentiment features if available
     if sentiment_df is not None and len(sentiment_df) > 0:
@@ -249,13 +250,10 @@ def create_model_dataset(price_df, sentiment_df, horizon_days):
     
     # Validation: Check for reasonable values
     st.write(f"✅ Dataset created: {len(X)} samples")
-    st.write(f"Target range: {y.min()*100:.2f}% to {y.max()*100:.2f}%")
+    y_min = y.min() * 100
+    y_max = y.max() * 100
+    st.write(f"Target range: {y_min:.2f}% to {y_max:.2f}%")
     st.write(f"Current price: ₹{current_price:.2f}")
-    
-    # Show feature statistics
-    feature_stats = pd.DataFrame(X, columns=feature_columns).describe()
-    st.write("📊 Feature statistics:")
-    st.dataframe(feature_stats.round(4))
     
     return X, y, dates, feature_columns, current_price
 
@@ -283,8 +281,8 @@ def train_prediction_model(price_df, sentiment_df, horizon_days):
     
     # Use Random Forest for stability
     model = RandomForestRegressor(
-        n_estimators=100,
-        max_depth=10,
+        n_estimators=50,
+        max_depth=8,
         min_samples_split=5,
         min_samples_leaf=2,
         random_state=42
@@ -294,11 +292,9 @@ def train_prediction_model(price_df, sentiment_df, horizon_days):
     model.fit(X_train_scaled, y_train)
     
     # Make predictions
-    y_pred_train = model.predict(X_train_scaled)
     y_pred_test = model.predict(X_test_scaled)
     
     # Calculate metrics
-    train_mae = mean_absolute_error(y_train, y_pred_train)
     test_mae = mean_absolute_error(y_test, y_pred_test)
     test_r2 = r2_score(y_test, y_pred_test)
     
@@ -314,13 +310,14 @@ def train_prediction_model(price_df, sentiment_df, horizon_days):
     if abs(predicted_pct_change) > max_change:
         predicted_pct_change = np.sign(predicted_pct_change) * max_change
         predicted_price = current_price * (1 + predicted_pct_change)
-        st.warning(f"Prediction capped at ±{max_change*100}% for safety")
+        st.warning(f"Prediction capped at ±15% for safety")
     
     st.write("✅ Model training complete")
-    st.write(f"Train MAE: {train_mae*100:.2f}%")
-    st.write(f"Test MAE: {test_mae*100:.2f}%")
+    mae_pct = test_mae * 100
+    st.write(f"Test MAE: {mae_pct:.2f}%")
     st.write(f"Test R²: {test_r2:.3f}")
-    st.write(f"Predicted change: {predicted_pct_change*100:+.2f}%")
+    change_pct = predicted_pct_change * 100
+    st.write(f"Predicted change: {change_pct:+.2f}%")
     
     return {
         "predicted_price": predicted_price,
@@ -340,34 +337,25 @@ def generate_trading_signal(current_price, predicted_price, predicted_change, ho
     if horizon == "INTRADAY":
         buy_threshold = 0.5   # 0.5%
         sell_threshold = -0.5 # -0.5%
+        stop_pct = 1.5
     elif horizon == "SHORT":
         buy_threshold = 1.0   # 1.0%
         sell_threshold = -1.0 # -1.0%
+        stop_pct = 2.5
     else:  # LONG
         buy_threshold = 2.0   # 2.0%
         sell_threshold = -2.0 # -2.0%
+        stop_pct = 4.0
     
     # Generate signal
     if price_change_pct > buy_threshold:
         action = "BUY"
+        stop_loss = current_price * (1 - stop_pct / 100)
     elif price_change_pct < sell_threshold:
         action = "SELL"
-    else:
-        action = "HOLD"
-    
-    # Calculate stop loss (2-4% based on horizon)
-    if horizon == "INTRADAY":
-        stop_pct = 1.5
-    elif horizon == "SHORT":
-        stop_pct = 2.5
-    else:
-        stop_pct = 4.0
-    
-    if action == "BUY":
-        stop_loss = current_price * (1 - stop_pct / 100)
-    elif action == "SELL":
         stop_loss = current_price * (1 + stop_pct / 100)
     else:
+        action = "HOLD"
         stop_loss = None
     
     direction = "UP" if price_change_pct > 0.2 else ("DOWN" if price_change_pct < -0.2 else "NEUTRAL")
@@ -391,7 +379,7 @@ def calculate_position_size(entry_price, stop_price, max_capital=15000):
     return quantity, total_cost
 
 # Streamlit UI
-st.title("🚀 NSE/BSE Stock Predictor - Fixed Predictions")
+st.title("🚀 NSE/BSE Stock Predictor - Working Version")
 st.write(f"**Market Status:** {'🟢 OPEN' if is_market_open_now() else '🔴 CLOSED'}")
 
 user_input = st.text_input("Enter stock symbol:", value="RELIANCE")
@@ -447,22 +435,34 @@ if st.button("🔍 Analyze Stock", type="primary"):
         st.metric("Direction", direction)
         if stop_loss:
             st.metric("Stop Loss", f"₹{stop_loss:.2f}")
-        st.metric("Investment (₹15K max)", f"₹{investment:,.0f}")
+        st.metric("Investment", f"₹{investment:,.0f}")
     
     # Model performance
     with st.expander("🤖 Model Performance"):
         perf_col1, perf_col2, perf_col3 = st.columns(3)
-        perf_col1.metric("Mean Absolute Error", f"{model_result['mae']*100:.2f}%")
+        mae_display = model_result['mae'] * 100
+        perf_col1.metric("Mean Absolute Error", f"{mae_display:.2f}%")
         perf_col2.metric("R² Score", f"{model_result['r2']:.3f}")
         perf_col3.metric("Training Samples", model_result['n_samples'])
     
     st.subheader("📈 Price History")
-    st.line_chart(price_data.set_index(price_data.index)["Close"])
+    chart_data = price_data["Close"].reset_index()
+    chart_data.columns = ['Date', 'Close']
+    st.line_chart(chart_data.set_index('Date'))
     
-    st.subheader("📝 Summary")
+    # Summary
+    st.subheader("📝 Trade Summary")
     st.write(f"**Stock:** {ticker}")
     st.write(f"**Date:** {datetime.now(INDIA_TZ).strftime('%Y-%m-%d %H:%M %Z')}")
     st.write(f"**Term:** {horizon}")
-    st.write(f"**Quantity:** {quantity} shares (₹{investment:,.0f})")
+    st.write(f"**Market Open:** {'YES' if is_market_open_now() else 'NO'}")
+    st.write(f"**Action:** {action}")
+    st.write(f"**Price:** ₹{entry:.2f}")
+    if stop_loss:
+        st.write(f"**Stop Loss:** ₹{stop_loss:.2f}")
+    st.write(f"**Predicted Price:** ₹{target:.2f}")
+    st.write(f"**Expected Move:** {price_change:+.2f}% ({direction})")
+    st.write(f"**Quantity:** {quantity} shares")
+    st.write(f"**Investment:** ₹{investment:,.0f}")
     
-    st.info("⚠️ Educational purposes only. Not financial advice.")
+    st.info("⚠️ This is for educational purposes only. Not financial advice. Always consult professionals before trading.")
