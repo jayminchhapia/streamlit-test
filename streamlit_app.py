@@ -4,20 +4,19 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timedelta
 from transformers import pipeline
 from sklearn.linear_model import SGDRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 
-st.set_page_config(page_title="NSE/BSE Predictor — robust merges & headlines", layout="wide")
+st.set_page_config(page_title="NSE/BSE Predictor - Fixed", layout="wide")
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
-FINBERT_MODEL = os.environ.get("FINBERT_MODEL", "ProsusAI/finbert")
 
 @st.cache_resource(show_spinner=False)
 def get_finbert():
     try:
-        return pipeline("sentiment-analysis", model=FINBERT_MODEL)
+        return pipeline("sentiment-analysis", model="ProsusAI/finbert")
     except Exception:
         return None
 
@@ -27,104 +26,151 @@ def is_market_open_now():
     close_t = now.replace(hour=15, minute=30, second=0, microsecond=0)
     return now.weekday() < 5 and (now >= open_t) and (now <= close_t)
 
-def guess_tickers(q: str):
-    q = q.strip().upper()
-    return [q] if (q.endswith(".NS") or q.endswith(".BO")) else [f"{q}.NS", f"{q}.BO"]
-
-def resolve_valid_ticker(user_query: str):
-    candidates = guess_tickers(user_query)
-    st.write("Candidates:", candidates)
-    for t in candidates:
+def resolve_ticker(user_query: str):
+    q = user_query.strip().upper()
+    candidates = [q] if (q.endswith(".NS") or q.endswith(".BO")) else [f"{q}.NS", f"{q}.BO"]
+    
+    st.write("🔍 Testing candidates:", candidates)
+    
+    for ticker in candidates:
         try:
-            df = yf.download(t, period="1mo", interval="1d", auto_adjust=True, progress=False)
+            df = yf.download(ticker, period="1mo", interval="1d", auto_adjust=True, progress=False)
             if df is not None and len(df.dropna()) > 10:
-                st.write(f"Resolved: {t}")
-                return t
+                st.write(f"✅ Resolved to: {ticker}")
+                return ticker
+            else:
+                st.write(f"❌ {ticker}: No sufficient data")
         except Exception as e:
-            st.write(f"{t} error: {e}")
-    st.error("Could not resolve ticker")
+            st.write(f"❌ {ticker}: Error - {str(e)}")
+    
+    st.error("Could not resolve any valid ticker")
     return None
 
-def fetch_prices_yf(ticker: str, start_date: date, end_date: date):
-    df = yf.download(ticker, start=start_date, end=end_date, interval="1d", auto_adjust=True, progress=False)
-    if df is None or len(df) == 0:
-        st.error("No yfinance data")
+def fetch_price_data(ticker: str, start_date: date, end_date: date):
+    st.write(f"📈 Fetching price data for {ticker}")
+    st.write(f"Period: {start_date} to {end_date}")
+    
+    try:
+        df = yf.download(ticker, start=start_date, end=end_date, interval="1d", auto_adjust=True, progress=False)
+        
+        if df is None or len(df) == 0:
+            st.error("No price data returned")
+            return pd.DataFrame()
+        
+        # Ensure we have Close column
+        if "Close" not in df.columns and "Adj Close" in df.columns:
+            df["Close"] = df["Adj Close"]
+        
+        # Keep essential columns
+        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
+        
+        st.write(f"✅ Price data: {len(df)} rows")
+        st.dataframe(df.head(5))
+        
+        return df
+        
+    except Exception as e:
+        st.error(f"Price fetch failed: {e}")
         return pd.DataFrame()
-    if "Close" not in df.columns and "Adj Close" in df.columns:
-        df["Close"] = df["Adj Close"]
-    df = df[["Open","High","Low","Close","Volume"]].dropna()
-    # Ensure naive datetime64[ns]
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    st.write(f"yfinance rows: {len(df)} | columns: {list(df.columns)}")
-    st.dataframe(df.head(10))
-    return df
 
-def fetch_news(ticker: str, limit: int = 20):
+def fetch_news_data(ticker: str, limit: int = 15):
+    st.write(f"📰 Fetching news for {ticker}")
+    
     try:
         t = yf.Ticker(ticker)
-        news_raw = t.news or []
+        news_raw = getattr(t, 'news', None) or []
+        
+        if not news_raw:
+            st.write("⚠️ No news available from yfinance")
+            return []
+        
+        valid_items = []
+        
+        for item in news_raw[:limit]:
+            # Extract fields safely
+            title = item.get("title", "").strip()
+            publisher = item.get("publisher", "").strip()
+            link = item.get("link", "").strip()
+            timestamp = item.get("providerPublishTime")
+            
+            # Skip if no title or invalid timestamp
+            if not title or not timestamp or timestamp <= 0:
+                continue
+                
+            # Convert timestamp
+            try:
+                pub_date = datetime.fromtimestamp(timestamp, tz=INDIA_TZ)
+                valid_items.append({
+                    "title": title,
+                    "publisher": publisher or "Unknown",
+                    "link": link or "No link",
+                    "pubDate": pub_date
+                })
+            except (ValueError, OSError):
+                continue
+        
+        st.write(f"✅ Found {len(valid_items)} valid headlines")
+        
+        # Display headlines clearly
+        if valid_items:
+            st.subheader("📰 Latest Headlines")
+            for i, item in enumerate(valid_items[:10], 1):
+                st.write(f"**{i}.** {item['title']}")
+                st.write(f"   📍 Source: {item['publisher']}")
+                if item['link'] != "No link":
+                    st.write(f"   🔗 [Read more]({item['link']})")
+                st.write("---")
+        else:
+            st.write("No headlines with valid timestamps found")
+        
+        return valid_items
+        
     except Exception as e:
-        st.write(f"news fetch error: {e}")
-        news_raw = []
+        st.write(f"⚠️ News fetch error: {e}")
+        return []
 
-    items = []
-    for n in news_raw[:limit]:
-        # Handle missing fields safely
-        title = n.get("title") or ""
-        publisher = n.get("publisher") or ""
-        link = n.get("link") or ""
-        ts = n.get("providerPublishTime")
-        # Filter invalid timestamps (None or <=0 -> skip to avoid 1970-01-01)
-        if ts is None or ts <= 0:
-            continue
-        pub_dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(INDIA_TZ)
-        items.append({"title": title, "publisher": publisher, "link": link, "pubDate": pub_dt})
-
-    st.write(f"Headlines fetched: {len(items)}")
-    # Display exact items clearly
-    if items:
-        st.subheader("Latest headlines")
-        for i, it in enumerate(items[:10], 1):
-            title = it['title'] or "(no title)"
-            pub = it['publisher'] or "(unknown)"
-            link = it['link'] or "(no link)"
-            st.write(f"{i}. {title} — {pub}")
-            if link and link != "(no link)":
-                st.write(link)
-    else:
-        st.write("No valid headlines with proper timestamps available.")
-
-    return items
-
-def score_headlines_finbert(headlines):
+def analyze_sentiment(headlines):
     if not headlines:
-        return pd.DataFrame(columns=["pubDate","title","sentiment","score"])
+        return pd.DataFrame(columns=["pubDate", "title", "sentiment", "score", "publisher"])
+    
     pipe = get_finbert()
     if pipe is None:
-        return pd.DataFrame(columns=["pubDate","title","sentiment","score"])
-    texts = [h["title"] for h in headlines if h.get("title")]
-    if not texts:
-        return pd.DataFrame(columns=["pubDate","title","sentiment","score"])
-    outputs = pipe(texts, truncation=True)
-    rows = []
-    j = 0
-    for h in headlines:
-        title = h.get("title")
-        if not title:
-            continue
-        o = outputs[j]
-        j += 1
-        rows.append({
-            "pubDate": pd.to_datetime(h["pubDate"]).tz_localize(None),
-            "title": title,
-            "sentiment": o.get("label", "neutral"),
-            "score": float(o.get("score", 0.0)),
-            "publisher": h.get("publisher", "")
-        })
-    df = pd.DataFrame(rows).sort_values("pubDate")
-    st.write("Sentiment distribution:", df["sentiment"].value_counts().to_dict())
-    st.dataframe(df.tail(10))
-    return df
+        st.write("⚠️ FinBERT not available, skipping sentiment analysis")
+        return pd.DataFrame(columns=["pubDate", "title", "sentiment", "score", "publisher"])
+    
+    st.write(f"🧠 Analyzing sentiment for {len(headlines)} headlines")
+    
+    # Extract titles for sentiment analysis
+    titles = [h["title"] for h in headlines]
+    
+    try:
+        # Run sentiment analysis
+        results = pipe(titles, truncation=True)
+        
+        # Combine results
+        sentiment_data = []
+        for headline, result in zip(headlines, results):
+            sentiment_data.append({
+                "pubDate": headline["pubDate"],
+                "title": headline["title"],
+                "sentiment": result["label"],
+                "score": float(result["score"]),
+                "publisher": headline["publisher"]
+            })
+        
+        df = pd.DataFrame(sentiment_data)
+        
+        # Show sentiment distribution
+        sentiment_counts = df["sentiment"].value_counts()
+        st.write("📊 Sentiment Distribution:")
+        for sentiment, count in sentiment_counts.items():
+            st.write(f"   {sentiment}: {count}")
+        
+        return df
+        
+    except Exception as e:
+        st.write(f"⚠️ Sentiment analysis failed: {e}")
+        return pd.DataFrame(columns=["pubDate", "title", "sentiment", "score", "publisher"])
 
 def compute_rsi(series, period=14):
     delta = series.diff()
@@ -133,191 +179,302 @@ def compute_rsi(series, period=14):
     rs = up / (down + 1e-12)
     return 100 - (100 / (1 + rs))
 
-def build_technicals(px: pd.DataFrame):
-    d = px.copy()
-    d["ret_1"] = d["Close"].pct_change()
-    d["ret_5"] = d["Close"].pct_change(5)
-    d["ma_5"] = d["Close"].rolling(5).mean()
-    d["ma_20"] = d["Close"].rolling(20).mean()
-    d["ma_ratio"] = d["ma_5"] / d["ma_20"]
-    d["rsi_14"] = compute_rsi(d["Close"], 14)
-    d["VIX"] = 0.0
-    d = d.dropna()
-    # Flatten to a Date column
-    d = d.reset_index().rename(columns={"index":"Date"})
-    d["Date"] = pd.to_datetime(d["Date"]).tz_localize(None)
-    st.write(f"Features rows: {len(d)}")
-    st.dataframe(d[["Date","Close","ret_1","ma_ratio","rsi_14"]].head(10))
-    return d
+def build_technical_features(price_data: pd.DataFrame):
+    st.write("🔧 Building technical features")
+    
+    df = price_data.copy()
+    
+    # Technical indicators
+    df["ret_1"] = df["Close"].pct_change()
+    df["ret_5"] = df["Close"].pct_change(5)
+    df["ma_5"] = df["Close"].rolling(5).mean()
+    df["ma_20"] = df["Close"].rolling(20).mean()
+    df["ma_ratio"] = df["ma_5"] / df["ma_20"]
+    df["rsi_14"] = compute_rsi(df["Close"], 14)
+    df["VIX"] = 15.0  # Default VIX value
+    
+    # Remove NaN rows
+    df = df.dropna()
+    
+    # Convert index to Date column properly
+    df = df.reset_index()
+    df = df.rename(columns={"Date": "Date"})
+    
+    # Ensure Date column is proper datetime
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    df["Date"] = pd.to_datetime(df["Date"])
+    
+    st.write(f"✅ Technical features: {len(df)} rows")
+    st.dataframe(df[["Date", "Close", "ret_1", "ma_ratio", "rsi_14"]].head(5))
+    
+    return df
 
-def aggregate_sentiment_daily(sent_df: pd.DataFrame):
-    if sent_df is None or len(sent_df) == 0:
-        st.write("No sentiment to aggregate")
-        return pd.DataFrame(columns=["Date","sent_mean","sent_count","sent_pos","sent_neg"])
-    df = sent_df.copy()
-    # Already naive datetime above; normalize to date
-    df["Date"] = pd.to_datetime(df["pubDate"]).dt.normalize()
-    label_to_sign = {"positive": 1, "negative": -1, "neutral": 0}
-    df["signed"] = df["sentiment"].str.lower().map(label_to_sign).fillna(0) * df["score"].fillna(0.0)
-    agg = df.groupby("Date", as_index=False).agg(
-        sent_pos=("signed", lambda s: float((s[s>0]).sum())),
-        sent_neg=("signed", lambda s: float((s[s<0]).sum())),
-        sent_mean=("signed", "mean"),
-        sent_count=("signed","count")
-    )
-    # Ensure correct dtypes and uniqueness
-    agg["Date"] = pd.to_datetime(agg["Date"]).tz_localize(None)
-    agg = agg.drop_duplicates(subset=["Date"])
-    st.write(f"Sentiment daily rows: {len(agg)}")
-    st.dataframe(agg.head(10))
-    return agg
+def aggregate_daily_sentiment(sentiment_df: pd.DataFrame):
+    if sentiment_df is None or len(sentiment_df) == 0:
+        st.write("⚠️ No sentiment data to aggregate")
+        return pd.DataFrame(columns=["Date", "sent_mean", "sent_count", "sent_pos", "sent_neg"])
+    
+    st.write("📊 Aggregating sentiment by day")
+    
+    df = sentiment_df.copy()
+    
+    # Convert to date only
+    df["Date"] = pd.to_datetime(df["pubDate"]).dt.date
+    df["Date"] = pd.to_datetime(df["Date"])
+    
+    # Map sentiment to numeric
+    sentiment_map = {"positive": 1, "negative": -1, "neutral": 0}
+    df["sentiment_score"] = df["sentiment"].str.lower().map(sentiment_map).fillna(0) * df["score"]
+    
+    # Aggregate by date
+    daily_sentiment = df.groupby("Date").agg({
+        "sentiment_score": ["mean", "count", lambda x: (x > 0).sum(), lambda x: (x < 0).sum()]
+    }).round(4)
+    
+    # Flatten column names
+    daily_sentiment.columns = ["sent_mean", "sent_count", "sent_pos", "sent_neg"]
+    daily_sentiment = daily_sentiment.reset_index()
+    
+    st.write(f"✅ Daily sentiment: {len(daily_sentiment)} days")
+    st.dataframe(daily_sentiment.head(5))
+    
+    return daily_sentiment
 
-def safe_merge_on_date(tech_df: pd.DataFrame, sent_daily: pd.DataFrame):
-    # Both should have a naive Date column
-    left = tech_df.copy()
-    left["Date"] = pd.to_datetime(left["Date"]).dt.normalize()
-    if sent_daily is None or len(sent_daily)==0:
-        for c in ["sent_mean","sent_count","sent_pos","sent_neg"]:
-            left[c] = 0.0
-        return left
-    right = sent_daily.copy()
-    right["Date"] = pd.to_datetime(right["Date"]).dt.normalize()
-    right = right.drop_duplicates(subset=["Date"])
-    # Safe typed columns
-    for c in ["sent_mean","sent_count","sent_pos","sent_neg"]:
-        if c in right.columns:
-            right[c] = pd.to_numeric(right[c], errors="coerce").fillna(0.0)
-        else:
-            right[c] = 0.0
-    try:
-        merged = pd.merge(left, right[["Date","sent_mean","sent_count","sent_pos","sent_neg"]],
-                          on="Date", how="left", validate="one_to_one")
-    except Exception as e:
-        st.write(f"merge failed: {e}")
-        # Fallback: align by Date via reindex
-        right_idx = right.set_index("Date")[["sent_mean","sent_count","sent_pos","sent_neg"]]
-        right_idx = right_idx[~right_idx.index.duplicated(keep="first")]
-        merged = left.set_index("Date").sort_index()
-        right_aligned = right_idx.reindex(merged.index).fillna(0.0)
-        merged = pd.concat([merged, right_aligned], axis=1).reset_index()
-        merged = merged.rename(columns={"index":"Date"})
-    # Fill NaNs after merge
-    for c in ["sent_mean","sent_count","sent_pos","sent_neg"]:
-        merged[c] = merged[c].fillna(0.0)
-    return merged
-
-def make_dataset(px: pd.DataFrame, sent_daily: pd.DataFrame, horizon_days: int):
-    tech = build_technicals(px)  # has Date col
-    merged = safe_merge_on_date(tech, sent_daily)
-    # Add earnings placeholder
-    merged["days_to_earnings"] = 0.0
-    # Sort
-    merged = merged.sort_values("Date")
-    # Target
-    merged["target"] = merged["Close"].shift(-horizon_days)
-    feature_cols = ["ret_1","ret_5","ma_5","ma_20","ma_ratio","rsi_14","VIX","sent_mean","sent_count","sent_pos","sent_neg","days_to_earnings"]
-    final_df = merged[["Date"] + feature_cols + ["target"]].dropna()
-    st.write(f"Final dataset rows: {len(final_df)} | features: {len(feature_cols)}")
-    st.dataframe(final_df.head(10))
-    if len(final_df) == 0:
+def create_final_dataset(tech_df: pd.DataFrame, sent_df: pd.DataFrame, horizon_days: int):
+    st.write(f"🏗️ Creating dataset for {horizon_days}-day prediction")
+    
+    # Start with technical data
+    final_df = tech_df.copy()
+    
+    # Add sentiment data if available
+    if sent_df is not None and len(sent_df) > 0:
+        final_df = pd.merge(final_df, sent_df, on="Date", how="left")
+        st.write("✅ Merged with sentiment data")
+    else:
+        # Add empty sentiment columns
+        for col in ["sent_mean", "sent_count", "sent_pos", "sent_neg"]:
+            final_df[col] = 0.0
+        st.write("⚠️ No sentiment data, using zeros")
+    
+    # Fill missing sentiment values
+    sentiment_cols = ["sent_mean", "sent_count", "sent_pos", "sent_neg"]
+    final_df[sentiment_cols] = final_df[sentiment_cols].fillna(0.0)
+    
+    # Add other features
+    final_df["days_to_earnings"] = 0.0
+    
+    # Create target variable
+    final_df = final_df.sort_values("Date")
+    final_df["target"] = final_df["Close"].shift(-horizon_days)
+    
+    # Select feature columns
+    feature_cols = [
+        "ret_1", "ret_5", "ma_5", "ma_20", "ma_ratio", "rsi_14", "VIX",
+        "sent_mean", "sent_count", "sent_pos", "sent_neg", "days_to_earnings"
+    ]
+    
+    # Create final dataset
+    model_data = final_df[["Date"] + feature_cols + ["target"]].dropna()
+    
+    if len(model_data) == 0:
+        st.error("No complete records for modeling")
         return None, None, None, None
-    X = final_df[feature_cols].values
-    y = final_df["target"].values
-    idx = final_df["Date"].values
-    return X, y, idx, feature_cols
+    
+    X = model_data[feature_cols].values
+    y = model_data["target"].values
+    dates = model_data["Date"].values
+    
+    st.write(f"✅ Final dataset: {len(X)} samples, {len(feature_cols)} features")
+    st.dataframe(model_data.head(5))
+    
+    return X, y, dates, feature_cols
 
-def train_and_predict(px: pd.DataFrame, sent_daily: pd.DataFrame, horizon_days: int):
-    X, y, idx, cols = make_dataset(px, sent_daily, horizon_days)
-    if X is None or len(y) < 40:
+def train_model(price_df: pd.DataFrame, sentiment_df: pd.DataFrame, horizon_days: int):
+    # Build dataset
+    tech_features = build_technical_features(price_df)
+    daily_sentiment = aggregate_daily_sentiment(sentiment_df)
+    X, y, dates, feature_cols = create_final_dataset(tech_features, daily_sentiment, horizon_days)
+    
+    if X is None or len(y) < 30:
+        st.error(f"Insufficient data for training. Got {len(y) if y is not None else 0} samples, need at least 30")
         return None
-    split = int(0.8 * len(y))
-    Xtr, Xte = X[:split], X[split:]
-    ytr, yte = y[:split], y[split:]
+    
+    st.write("🤖 Training model")
+    
+    # Split data
+    split_point = int(0.8 * len(y))
+    X_train, X_test = X[:split_point], X[split_point:]
+    y_train, y_test = y[:split_point], y[split_point:]
+    
+    # Train model
     scaler = StandardScaler()
     model = SGDRegressor(loss="squared_error", penalty="l2", alpha=1e-4, random_state=42)
-    Xtr_b = scaler.fit_transform(Xtr)
-    model.partial_fit(Xtr_b, ytr)
-    yhat_te = model.predict(scaler.transform(Xte))
-    mae = mean_absolute_error(yte, yhat_te)
-    r2 = r2_score(yte, yhat_te)
-    sigma = np.std(yte - yhat_te, ddof=1) if len(yte) > 1 else 0.0
-    yhat_all = model.predict(scaler.transform(X))
-    next_pred = yhat_all[-1]
-    return {"pred": next_pred, "sigma": sigma, "last_close": float(px["Close"].iloc[-1]),
-            "mae": mae, "r2": r2, "n_samples": len(X)}
+    
+    X_train_scaled = scaler.fit_transform(X_train)
+    model.partial_fit(X_train_scaled, y_train)
+    
+    # Evaluate
+    X_test_scaled = scaler.transform(X_test)
+    y_pred = model.predict(X_test_scaled)
+    
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    sigma = np.std(y_test - y_pred, ddof=1) if len(y_test) > 1 else 0.0
+    
+    # Make prediction
+    X_all_scaled = scaler.transform(X)
+    y_all_pred = model.predict(X_all_scaled)
+    next_prediction = y_all_pred[-1]
+    
+    st.write("✅ Model training complete")
+    
+    return {
+        "prediction": next_prediction,
+        "current_price": float(price_df["Close"].iloc[-1]),
+        "mae": mae,
+        "r2": r2,
+        "sigma": sigma,
+        "n_samples": len(X)
+    }
 
-def generate_signal(last_close, pred_price, sigma, horizon_label):
-    exp_move = (pred_price - last_close) / last_close if last_close > 0 else 0.0
-    band = 0.01 if horizon_label=="INTRADAY" else (0.02 if horizon_label=="SHORT" else 0.05)
-    if exp_move > band:
+def generate_trading_signal(current_price, predicted_price, sigma, horizon):
+    price_change = (predicted_price - current_price) / current_price * 100
+    
+    # Thresholds based on horizon
+    if horizon == "INTRADAY":
+        threshold = 1.0  # 1%
+    elif horizon == "SHORT":
+        threshold = 2.0  # 2%
+    else:  # LONG
+        threshold = 3.0  # 3%
+    
+    if price_change > threshold:
         action = "BUY"
-    elif exp_move < -band:
+    elif price_change < -threshold:
         action = "SELL"
     else:
         action = "HOLD"
-    stop_pct = max(0.01, min(0.05, 2*sigma/last_close)) if sigma>0 else 0.02
-    if action=="BUY":
-        entry=last_close; stoploss=entry*(1-stop_pct); target=pred_price
-    elif action=="SELL":
-        entry=last_close; stoploss=entry*(1+stop_pct); target=pred_price
+    
+    # Calculate stop loss
+    if sigma > 0:
+        stop_pct = max(1.0, min(5.0, 200 * sigma / current_price))  # 1-5%
     else:
-        entry=last_close; stoploss=None; target=pred_price
-    exp_pct = exp_move*100
-    direction = "UP" if exp_pct>0.5 else ("DOWN" if exp_pct<-0.5 else "NEUTRAL")
-    return action, entry, stoploss, target, exp_pct, direction
-
-def position_size(entry: float, stop: float|None, cap: float=15000.0):
-    if entry<=0: return 0, 0.0
-    if stop:
-        rps = abs(entry-stop); max_risk = 0.01*cap; qty = int(max_risk/rps) if rps>0 else 0
+        stop_pct = 2.0  # Default 2%
+    
+    if action == "BUY":
+        entry_price = current_price
+        stop_loss = entry_price * (1 - stop_pct / 100)
+        target_price = predicted_price
+    elif action == "SELL":
+        entry_price = current_price
+        stop_loss = entry_price * (1 + stop_pct / 100)
+        target_price = predicted_price
     else:
-        qty = int(0.1*cap/entry)
-    qty = max(1, min(qty, int(cap/entry)))
-    return qty, qty*entry
+        entry_price = current_price
+        stop_loss = None
+        target_price = predicted_price
+    
+    direction = "UP" if price_change > 0.5 else ("DOWN" if price_change < -0.5 else "NEUTRAL")
+    
+    return action, entry_price, stop_loss, target_price, price_change, direction
 
-st.title("NSE/BSE Stock Predictor — robust merges & sources")
-st.write(f"Market open? {'YES' if is_market_open_now() else 'NO'}")
+def calculate_position_size(entry_price, stop_price, max_capital=15000):
+    if entry_price <= 0:
+        return 0, 0
+    
+    if stop_price and stop_price > 0:
+        risk_per_share = abs(entry_price - stop_price)
+        max_risk = max_capital * 0.01  # 1% risk
+        quantity = int(max_risk / risk_per_share) if risk_per_share > 0 else 0
+    else:
+        quantity = int(max_capital * 0.1 / entry_price)  # 10% of capital
+    
+    quantity = max(1, min(quantity, int(max_capital / entry_price)))
+    total_cost = quantity * entry_price
+    
+    return quantity, total_cost
 
-user_query = st.text_input("Symbol or name (e.g., RELIANCE or RELIANCE.NS)", value="RELIANCE")
-horizon_label = st.selectbox("Horizon", ["INTRADAY","SHORT","LONG"], index=0)
-lookback_days = st.slider("Lookback days", 90, 730, 365)
+# Streamlit UI
+st.title("🚀 NSE/BSE Stock Predictor")
+st.write(f"**Market Status:** {'🟢 OPEN' if is_market_open_now() else '🔴 CLOSED'}")
 
-if st.button("Analyze", type="primary"):
-    ticker = resolve_valid_ticker(user_query)
+# Input controls
+user_input = st.text_input("Enter stock symbol or name:", value="RELIANCE", help="e.g., RELIANCE, TCS, INFY, or RELIANCE.NS")
+horizon = st.selectbox("Trading Horizon:", ["INTRADAY", "SHORT", "LONG"], help="INTRADAY=1 day, SHORT=5 days, LONG=20 days")
+lookback = st.slider("Historical data (days):", min_value=90, max_value=730, value=365)
+
+if st.button("🔍 Analyze Stock", type="primary"):
+    # Step 1: Resolve ticker
+    ticker = resolve_ticker(user_input)
     if not ticker:
         st.stop()
+    
+    # Step 2: Fetch price data
     end_date = date.today()
-    start_date = end_date - timedelta(days=lookback_days)
-    px = fetch_prices_yf(ticker, start_date, end_date)
-    if px.empty:
+    start_date = end_date - timedelta(days=lookback)
+    price_data = fetch_price_data(ticker, start_date, end_date)
+    
+    if price_data.empty:
+        st.error("No price data available")
         st.stop()
-    headlines = fetch_news(ticker, limit=20)
-    sent_rows = score_headlines_finbert(headlines)
-    sent_daily = aggregate_sentiment_daily(sent_rows)
-    horizon_days = {"INTRADAY":1,"SHORT":5,"LONG":20}[horizon_label]
-    pred = train_and_predict(px, sent_daily, horizon_days)
-    if pred is None:
-        st.error("Insufficient data; increase lookback or pick a different ticker.")
+    
+    # Step 3: Fetch and analyze news
+    news_headlines = fetch_news_data(ticker, limit=15)
+    sentiment_data = analyze_sentiment(news_headlines)
+    
+    # Step 4: Train model and predict
+    horizon_days = {"INTRADAY": 1, "SHORT": 5, "LONG": 20}[horizon]
+    model_result = train_model(price_data, sentiment_data, horizon_days)
+    
+    if model_result is None:
+        st.error("Could not train model with available data")
         st.stop()
-    action, entry, stoploss, target, exp_pct, direction = generate_signal(
-        pred["last_close"], pred["pred"], pred["sigma"], horizon_label
+    
+    # Step 5: Generate trading signal
+    action, entry, stop_loss, target, price_change, direction = generate_trading_signal(
+        model_result["current_price"], model_result["prediction"], model_result["sigma"], horizon
     )
-    qty, total = position_size(entry, stoploss)
-    st.subheader("Recommendation")
-    st.write(f"STOCK_NAME: {ticker}")
-    st.write(f"DATE: {datetime.now(INDIA_TZ).strftime('%Y-%m-%d %H:%M %Z')}")
-    st.write(f"TERM: {horizon_label}")
-    st.write(f"MARKET IS CURRENTLY OPEN? {'YES' if is_market_open_now() else 'NO'}")
-    st.write(f"ACTION: {action}")
-    st.write(f"PRICE: ₹{entry:.2f}")
-    st.write(f"STOPLOSS: {'₹'+format(stoploss,'.2f') if stoploss else 'N/A'}")
-    st.write(f"PREDICTED PRICE: ₹{target:.2f}")
-    st.write(f"EXPECTED MOVE: {exp_pct:+.2f}% ({direction})")
-    st.write(f"QTY (≤ ₹15,000): {qty} (₹{total:,.0f})")
-    st.subheader("Model Performance")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("MAE", f"₹{pred['mae']:.2f}")
-    c2.metric("R²", f"{pred['r2']:.3f}")
-    c3.metric("Samples", pred["n_samples"])
-    st.subheader("Close Price")
-    st.line_chart(px["Close"])
+    
+    # Step 6: Calculate position size
+    quantity, investment = calculate_position_size(entry, stop_loss)
+    
+    # Display results
+    st.success("✅ Analysis Complete!")
+    
+    # Main recommendation
+    st.subheader("📋 Trading Recommendation")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Stock", ticker)
+        st.metric("Action", action)
+        st.metric("Current Price", f"₹{entry:.2f}")
+        st.metric("Predicted Price", f"₹{target:.2f}")
+    
+    with col2:
+        st.metric("Expected Move", f"{price_change:+.2f}%")
+        st.metric("Direction", direction)
+        if stop_loss:
+            st.metric("Stop Loss", f"₹{stop_loss:.2f}")
+        st.metric("Quantity (₹15K max)", f"{quantity} shares")
+    
+    # Model performance
+    with st.expander("🤖 Model Performance"):
+        perf_col1, perf_col2, perf_col3 = st.columns(3)
+        perf_col1.metric("Mean Absolute Error", f"₹{model_result['mae']:.2f}")
+        perf_col2.metric("R² Score", f"{model_result['r2']:.3f}")
+        perf_col3.metric("Training Samples", model_result['n_samples'])
+    
+    # Price chart
+    st.subheader("📈 Price History")
+    st.line_chart(price_data.set_index(price_data.index)["Close"])
+    
+    # Summary details
+    st.subheader("📝 Summary")
+    st.write(f"**Stock:** {ticker}")
+    st.write(f"**Date:** {datetime.now(INDIA_TZ).strftime('%Y-%m-%d %H:%M %Z')}")
+    st.write(f"**Term:** {horizon}")
+    st.write(f"**Market Open:** {'YES' if is_market_open_now() else 'NO'}")
+    st.write(f"**Investment:** ₹{investment:,.0f} ({quantity} shares)")
+    
+    st.info("⚠️ This is for educational purposes only. Not financial advice. Always do your own research and consult professionals before trading.")
