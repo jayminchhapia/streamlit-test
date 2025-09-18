@@ -4,15 +4,16 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from transformers import pipeline
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_absolute_error, r2_score
 
-st.set_page_config(page_title="NSE/BSE Predictor - Working Version", layout="wide")
+st.set_page_config(page_title="NSE/BSE Predictor — stable merges & headlines", layout="wide")
 INDIA_TZ = pytz.timezone("Asia/Kolkata")
 
+# ---------- Utilities ----------
 @st.cache_resource(show_spinner=False)
 def get_finbert():
     try:
@@ -28,134 +29,97 @@ def is_market_open_now():
 
 def resolve_ticker(user_query: str):
     q = user_query.strip().upper()
-    candidates = [q] if (q.endswith(".NS") or q.endswith(".BO")) else [f"{q}.NS", f"{q}.BO"]
-    
-    st.write("🔍 Testing candidates:", candidates)
-    
-    for ticker in candidates:
+    cands = [q] if (q.endswith(".NS") or q.endswith(".BO")) else [f"{q}.NS", f"{q}.BO"]
+    st.write("Candidates:", cands)
+    for t in cands:
         try:
-            df = yf.download(ticker, period="1mo", interval="1d", auto_adjust=True, progress=False)
+            df = yf.download(t, period="1mo", interval="1d", auto_adjust=True, progress=False)
             if df is not None and len(df.dropna()) > 10:
-                st.write(f"✅ Resolved to: {ticker}")
-                return ticker
-            else:
-                st.write(f"❌ {ticker}: No sufficient data")
+                st.write(f"Resolved: {t}")
+                return t
         except Exception as e:
-            st.write(f"❌ {ticker}: Error - {str(e)}")
-    
-    st.error("Could not resolve any valid ticker")
+            st.write(f"{t} error: {e}")
+    st.error("Could not resolve ticker")
     return None
 
-def fetch_price_data(ticker: str, start_date: date, end_date: date):
-    st.write(f"📈 Fetching price data for {ticker}")
-    st.write(f"Period: {start_date} to {end_date}")
-    
-    try:
-        df = yf.download(ticker, start=start_date, end=end_date, interval="1d", auto_adjust=True, progress=False)
-        
-        if df is None or len(df) == 0:
-            st.error("No price data returned")
-            return pd.DataFrame()
-        
-        # Ensure we have Close column
-        if "Close" not in df.columns and "Adj Close" in df.columns:
-            df["Close"] = df["Adj Close"]
-        
-        # Keep essential columns and ensure no negative prices
-        df = df[["Open", "High", "Low", "Close", "Volume"]].dropna()
-        df = df[df["Close"] > 0]  # Remove any invalid price data
-        
-        st.write(f"✅ Price data: {len(df)} rows")
-        min_price = df['Close'].min()
-        max_price = df['Close'].max()
-        st.write(f"Price range: ₹{min_price:.2f} to ₹{max_price:.2f}")
-        st.dataframe(df.head(5))
-        
-        return df
-        
-    except Exception as e:
-        st.error(f"Price fetch failed: {str(e)}")
+# ---------- Data fetch ----------
+def fetch_prices_yf(ticker: str, start_date: date, end_date: date):
+    df = yf.download(ticker, start=start_date, end=end_date, interval="1d", auto_adjust=True, progress=False)
+    if df is None or len(df) == 0:
+        st.error("No price data from yfinance")
         return pd.DataFrame()
+    if "Close" not in df.columns and "Adj Close" in df.columns:
+        df["Close"] = df["Adj Close"]
+    df = df[["Open","High","Low","Close","Volume"]].dropna()
+    df = df[df["Close"] > 0]
+    df.index = pd.to_datetime(df.index).tz_localize(None)
+    st.write(f"Price rows: {len(df)} | range ₹{df['Close'].min():.2f}–₹{df['Close'].max():.2f}")
+    st.dataframe(df.head(8))
+    return df
 
-def fetch_news_data(ticker: str, limit: int = 10):
-    st.write(f"📰 Fetching news for {ticker}")
-    
+def fetch_news(ticker: str, limit: int = 12):
     try:
         t = yf.Ticker(ticker)
-        news_raw = getattr(t, 'news', None) or []
-        
-        if not news_raw:
-            st.write("⚠️ No news available from yfinance")
-            return []
-        
-        valid_items = []
-        
-        for item in news_raw[:limit]:
-            title = item.get("title", "").strip()
-            publisher = item.get("publisher", "").strip()
-            link = item.get("link", "").strip()
-            timestamp = item.get("providerPublishTime")
-            
-            if not title or not timestamp or timestamp <= 0:
-                continue
-                
-            try:
-                pub_date = datetime.fromtimestamp(timestamp, tz=INDIA_TZ)
-                valid_items.append({
-                    "title": title,
-                    "publisher": publisher or "Unknown",
-                    "link": link or "No link",
-                    "pubDate": pub_date
-                })
-            except (ValueError, OSError):
-                continue
-        
-        st.write(f"✅ Found {len(valid_items)} valid headlines")
-        
-        if valid_items:
-            st.subheader("📰 Latest Headlines")
-            for i, item in enumerate(valid_items[:5], 1):
-                st.write(f"**{i}.** {item['title']}")
-                st.write(f"   📍 Source: {item['publisher']}")
-        
-        return valid_items
-        
+        news_raw = getattr(t, "news", None) or []
     except Exception as e:
-        st.write(f"⚠️ News fetch error: {str(e)}")
-        return []
+        st.write(f"news fetch error: {e}")
+        news_raw = []
 
-def analyze_sentiment(headlines):
+    items = []
+    for n in news_raw[:limit]:
+        title = (n.get("title") or "").strip()
+        publisher = (n.get("publisher") or "").strip()
+        link = (n.get("link") or "").strip()
+        ts = n.get("providerPublishTime")
+        if not title or not ts or ts <= 0:
+            continue
+        try:
+            pub_dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(INDIA_TZ)
+        except Exception:
+            continue
+        items.append({"title": title, "publisher": publisher or "Unknown", "link": link or "", "pubDate": pub_dt})
+
+    st.write(f"Headlines with valid timestamps: {len(items)}")
+    if items:
+        st.subheader("Latest headlines (source and link)")
+        for i, it in enumerate(items[:10], 1):
+            st.write(f"{i}. {it['title']} — {it['publisher']}")
+            if it["link"]:
+                st.write(it["link"])
+    else:
+        st.write("No valid headlines available right now.")
+
+    return items
+
+def score_headlines_finbert(headlines):
     if not headlines:
-        return pd.DataFrame(columns=["pubDate", "title", "sentiment", "score"])
-    
+        return pd.DataFrame(columns=["pubDate","title","sentiment","score","publisher"])
     pipe = get_finbert()
     if pipe is None:
-        st.write("⚠️ FinBERT not available")
-        return pd.DataFrame(columns=["pubDate", "title", "sentiment", "score"])
-    
-    try:
-        titles = [h["title"] for h in headlines]
-        results = pipe(titles, truncation=True)
-        
-        sentiment_data = []
-        for headline, result in zip(headlines, results):
-            sentiment_data.append({
-                "pubDate": headline["pubDate"],
-                "title": headline["title"],
-                "sentiment": result["label"],
-                "score": float(result["score"])
-            })
-        
-        df = pd.DataFrame(sentiment_data)
-        sentiment_counts = df["sentiment"].value_counts()
-        st.write("📊 Sentiment Distribution:", dict(sentiment_counts))
-        
-        return df
-        
-    except Exception as e:
-        st.write(f"⚠️ Sentiment analysis failed: {str(e)}")
-        return pd.DataFrame(columns=["pubDate", "title", "sentiment", "score"])
+        return pd.DataFrame(columns=["pubDate","title","sentiment","score","publisher"])
+    texts = [h["title"] for h in headlines if h.get("title")]
+    if not texts:
+        return pd.DataFrame(columns=["pubDate","title","sentiment","score","publisher"])
+    outputs = pipe(texts, truncation=True)
+    rows = []
+    j = 0
+    for h in headlines:
+        if not h.get("title"):
+            continue
+        o = outputs[j]; j += 1
+        rows.append({
+            "pubDate": pd.to_datetime(h["pubDate"]).tz_localize(None),
+            "title": h["title"],
+            "sentiment": o.get("label", "neutral"),
+            "score": float(o.get("score", 0.0)),
+            "publisher": h.get("publisher", "")
+        })
+    df = pd.DataFrame(rows).sort_values("pubDate")
+    st.write("Sentiment counts:", df["sentiment"].value_counts().to_dict())
+    st.dataframe(df.tail(8))
+    return df
 
+# ---------- Features & dataset ----------
 def compute_rsi(series, period=14):
     delta = series.diff()
     up = delta.clip(lower=0).ewm(alpha=1/period, adjust=False).mean()
@@ -163,306 +127,201 @@ def compute_rsi(series, period=14):
     rs = up / (down + 1e-8)
     return 100 - (100 / (1 + rs))
 
-def compute_technical_indicators(price_df):
-    """Compute technical indicators with proper bounds checking"""
-    df = price_df.copy()
-    
-    # Price-based features (percentage changes are bounded)
-    df['ret_1'] = df['Close'].pct_change().clip(-0.2, 0.2)  # Limit to ±20%
-    df['ret_5'] = df['Close'].pct_change(5).clip(-0.5, 0.5)  # Limit to ±50%
-    
-    # Moving averages (use ratios to normalize)
-    df['sma_5'] = df['Close'].rolling(5).mean()
-    df['sma_20'] = df['Close'].rolling(20).mean()
-    df['ma_ratio'] = (df['sma_5'] / df['sma_20']).clip(0.8, 1.2)  # Reasonable range
-    
-    # RSI (already bounded 0-100)
-    df['rsi'] = compute_rsi(df['Close']).clip(0, 100)
-    
-    # Volume ratio (normalize by median)
-    median_vol = df['Volume'].rolling(20).median()
-    df['vol_ratio'] = (df['Volume'] / median_vol).clip(0.1, 5.0)
-    
-    # Volatility (using rolling std of returns)
-    df['volatility'] = df['ret_1'].rolling(10).std().clip(0, 0.1)
-    
-    return df
+def compute_technicals(price_df: pd.DataFrame):
+    d = price_df.copy()
+    d["ret_1"] = d["Close"].pct_change().clip(-0.2, 0.2)
+    d["ret_5"] = d["Close"].pct_change(5).clip(-0.5, 0.5)
+    d["sma_5"] = d["Close"].rolling(5).mean()
+    d["sma_20"] = d["Close"].rolling(20).mean()
+    d["ma_ratio"] = (d["sma_5"] / d["sma_20"]).clip(0.8, 1.2)
+    d["rsi"] = compute_rsi(d["Close"]).clip(0, 100)
+    med_vol = d["Volume"].rolling(20).median()
+    d["vol_ratio"] = (d["Volume"] / med_vol).replace([np.inf, -np.inf], np.nan).clip(0.1, 5.0)
+    d["volatility"] = d["ret_1"].rolling(10).std().clip(0, 0.1)
+    d = d.dropna()
+    d = d.reset_index().rename(columns={"index":"Date"})
+    d["Date"] = pd.to_datetime(d["Date"]).dt.normalize()
+    st.write(f"Technical rows: {len(d)}")
+    st.dataframe(d[["Date","Close","ret_1","ma_ratio","rsi"]].head(8))
+    return d
 
-def create_model_dataset(price_df, sentiment_df, horizon_days):
-    """Create dataset with proper target variable and feature validation"""
-    st.write(f"🏗️ Creating dataset for {horizon_days}-day prediction")
-    
-    # Compute technical indicators
-    df = compute_technical_indicators(price_df)
-    
-    # Add date column
-    df = df.reset_index()
-    df['Date'] = pd.to_datetime(df.index.values if 'Date' not in df.columns else df['Date'])
-    
-    # Add sentiment features if available
-    if sentiment_df is not None and len(sentiment_df) > 0:
-        # Aggregate sentiment by day
-        sent_daily = sentiment_df.copy()
-        sent_daily['Date'] = pd.to_datetime(sent_daily['pubDate']).dt.date
-        sent_daily['Date'] = pd.to_datetime(sent_daily['Date'])
-        
-        # Convert sentiment to numeric
-        sentiment_map = {"positive": 1, "negative": -1, "neutral": 0}
-        sent_daily['sent_numeric'] = sent_daily['sentiment'].map(sentiment_map) * sent_daily['score']
-        
-        # Aggregate by date
-        sent_agg = sent_daily.groupby('Date').agg({
-            'sent_numeric': ['mean', 'count']
-        }).round(4)
-        sent_agg.columns = ['sent_score', 'sent_count']
-        sent_agg = sent_agg.reset_index()
-        
-        # Merge with price data
-        df = pd.merge(df, sent_agg, on='Date', how='left')
-        df['sent_score'] = df['sent_score'].fillna(0).clip(-1, 1)
-        df['sent_count'] = df['sent_count'].fillna(0).clip(0, 10)
-    else:
-        df['sent_score'] = 0.0
-        df['sent_count'] = 0.0
-    
-    # Create target variable (percentage change instead of absolute price)
-    df = df.sort_values('Date')
-    future_prices = df['Close'].shift(-horizon_days)
-    df['target_pct_change'] = ((future_prices - df['Close']) / df['Close']).clip(-0.3, 0.3)  # Limit to ±30%
-    
-    # Select features (all normalized/bounded)
-    feature_columns = [
-        'ret_1', 'ret_5', 'ma_ratio', 'rsi', 'vol_ratio', 'volatility',
-        'sent_score', 'sent_count'
-    ]
-    
-    # Create final dataset
-    df_clean = df[['Date', 'Close'] + feature_columns + ['target_pct_change']].dropna()
-    
-    if len(df_clean) < 50:
-        st.error(f"Insufficient data: {len(df_clean)} samples. Need at least 50.")
-        return None, None, None, None, None
-    
-    X = df_clean[feature_columns].values
-    y = df_clean['target_pct_change'].values  # Predicting percentage change
-    dates = df_clean['Date'].values
-    current_price = df_clean['Close'].iloc[-1]
-    
-    # Validation: Check for reasonable values
-    st.write(f"✅ Dataset created: {len(X)} samples")
-    y_min = y.min() * 100
-    y_max = y.max() * 100
-    st.write(f"Target range: {y_min:.2f}% to {y_max:.2f}%")
-    st.write(f"Current price: ₹{current_price:.2f}")
-    
-    return X, y, dates, feature_columns, current_price
-
-def train_prediction_model(price_df, sentiment_df, horizon_days):
-    """Train model with proper validation and bounds checking"""
-    
-    # Create dataset
-    result = create_model_dataset(price_df, sentiment_df, horizon_days)
-    if result[0] is None:
-        return None
-    
-    X, y, dates, feature_columns, current_price = result
-    
-    st.write("🤖 Training prediction model")
-    
-    # Split data (80/20)
-    split_point = int(0.8 * len(X))
-    X_train, X_test = X[:split_point], X[split_point:]
-    y_train, y_test = y[:split_point], y[split_point:]
-    
-    # Scale features
-    scaler = StandardScaler()
-    X_train_scaled = scaler.fit_transform(X_train)
-    X_test_scaled = scaler.transform(X_test)
-    
-    # Use Random Forest for stability
-    model = RandomForestRegressor(
-        n_estimators=50,
-        max_depth=8,
-        min_samples_split=5,
-        min_samples_leaf=2,
-        random_state=42
+def aggregate_sentiment_daily(sent_df: pd.DataFrame):
+    if sent_df is None or len(sent_df) == 0:
+        st.write("No sentiment rows to aggregate")
+        return pd.DataFrame(columns=["Date","sent_score","sent_count"])
+    df = sent_df.copy()
+    df["Date"] = pd.to_datetime(df["pubDate"]).dt.normalize()
+    sent_map = {"positive": 1, "negative": -1, "neutral": 0}
+    df["sent_num"] = df["sentiment"].str.lower().map(sent_map).fillna(0) * df["score"].fillna(0.0)
+    agg = df.groupby("Date", as_index=False).agg(
+        sent_score=("sent_num","mean"),
+        sent_count=("sent_num","count"),
     )
-    
-    # Train model
-    model.fit(X_train_scaled, y_train)
-    
-    # Make predictions
-    y_pred_test = model.predict(X_test_scaled)
-    
-    # Calculate metrics
-    test_mae = mean_absolute_error(y_test, y_pred_test)
-    test_r2 = r2_score(y_test, y_pred_test)
-    
-    # Predict next value
-    X_latest = scaler.transform(X[-1:])
-    predicted_pct_change = model.predict(X_latest)[0]
-    
-    # Convert percentage change back to price
-    predicted_price = current_price * (1 + predicted_pct_change)
-    
-    # Sanity check: limit prediction to reasonable bounds
-    max_change = 0.15  # Max 15% change
-    if abs(predicted_pct_change) > max_change:
-        predicted_pct_change = np.sign(predicted_pct_change) * max_change
-        predicted_price = current_price * (1 + predicted_pct_change)
-        st.warning(f"Prediction capped at ±15% for safety")
-    
-    st.write("✅ Model training complete")
-    mae_pct = test_mae * 100
-    st.write(f"Test MAE: {mae_pct:.2f}%")
-    st.write(f"Test R²: {test_r2:.3f}")
-    change_pct = predicted_pct_change * 100
-    st.write(f"Predicted change: {change_pct:+.2f}%")
-    
-    return {
-        "predicted_price": predicted_price,
-        "current_price": current_price,
-        "predicted_change": predicted_pct_change,
-        "mae": test_mae,
-        "r2": test_r2,
-        "n_samples": len(X)
-    }
+    agg["Date"] = pd.to_datetime(agg["Date"]).dt.normalize()
+    agg = agg.drop_duplicates(subset=["Date"])
+    st.write(f"Sentiment daily rows: {len(agg)}")
+    st.dataframe(agg.head(8))
+    return agg
 
-def generate_trading_signal(current_price, predicted_price, predicted_change, horizon):
-    """Generate trading signal with realistic thresholds"""
-    
-    price_change_pct = predicted_change * 100
-    
-    # Define realistic thresholds
-    if horizon == "INTRADAY":
-        buy_threshold = 0.5   # 0.5%
-        sell_threshold = -0.5 # -0.5%
-        stop_pct = 1.5
-    elif horizon == "SHORT":
-        buy_threshold = 1.0   # 1.0%
-        sell_threshold = -1.0 # -1.0%
-        stop_pct = 2.5
-    else:  # LONG
-        buy_threshold = 2.0   # 2.0%
-        sell_threshold = -2.0 # -2.0%
-        stop_pct = 4.0
-    
-    # Generate signal
-    if price_change_pct > buy_threshold:
+def safe_merge_on_date(tech_df: pd.DataFrame, sent_daily: pd.DataFrame):
+    left = tech_df.copy()
+    left["Date"] = pd.to_datetime(left["Date"]).dt.normalize()
+    if sent_daily is None or len(sent_daily) == 0:
+        left["sent_score"] = 0.0
+        left["sent_count"] = 0.0
+        return left
+    right = sent_daily.copy()
+    right["Date"] = pd.to_datetime(right["Date"]).dt.normalize()
+    right = right.drop_duplicates(subset=["Date"])
+    # enforce numeric types
+    for c in ["sent_score","sent_count"]:
+        if c in right.columns:
+            right[c] = pd.to_numeric(right[c], errors="coerce").fillna(0.0)
+        else:
+            right[c] = 0.0
+    # Try merge; if it fails (tz/resolution issues), fallback to reindex alignment
+    try:
+        merged = pd.merge(left, right[["Date","sent_score","sent_count"]],
+                          on="Date", how="left", validate="one_to_one")
+    except Exception as e:
+        st.write(f"merge failed, using fallback align: {e}")
+        r_idx = right.set_index("Date")[["sent_score","sent_count"]]
+        r_idx = r_idx[~r_idx.index.duplicated(keep="first")]
+        l_idx = left.set_index("Date").sort_index()
+        aligned = r_idx.reindex(l_idx.index).fillna(0.0)
+        merged = pd.concat([l_idx, aligned], axis=1).reset_index()
+        merged = merged.rename(columns={"index":"Date"})
+    merged["sent_score"] = merged["sent_score"].fillna(0.0)
+    merged["sent_count"] = merged["sent_count"].fillna(0.0)
+    return merged
+
+def make_dataset(price_df: pd.DataFrame, sent_daily: pd.DataFrame, horizon_days: int):
+    tech = compute_technicals(price_df)
+    merged = safe_merge_on_date(tech, sent_daily)
+    merged = merged.sort_values("Date")
+    # target as percent change for stability
+    future = merged["Close"].shift(-horizon_days)
+    merged["target_pct"] = ((future - merged["Close"]) / merged["Close"]).clip(-0.3, 0.3)
+    feature_cols = ["ret_1","ret_5","ma_ratio","rsi","vol_ratio","volatility","sent_score","sent_count"]
+    dataset = merged[["Date","Close"] + feature_cols + ["target_pct"]].dropna()
+    st.write(f"Final dataset rows: {len(dataset)} | features: {len(feature_cols)}")
+    st.dataframe(dataset.head(8))
+    if len(dataset) < 50:
+        return None, None, None, None, None
+    X = dataset[feature_cols].values
+    y = dataset["target_pct"].values
+    dates = dataset["Date"].values
+    cur_price = float(dataset["Close"].iloc[-1])
+    return X, y, dates, feature_cols, cur_price
+
+# ---------- Model ----------
+def train_and_predict(price_df: pd.DataFrame, sent_daily: pd.DataFrame, horizon_days: int):
+    res = make_dataset(price_df, sent_daily, horizon_days)
+    if res[0] is None:
+        return None
+    X, y, dates, feature_cols, current_price = res
+    split = int(0.8 * len(y))
+    Xtr, Xte = X[:split], X[split:]
+    ytr, yte = y[:split], y[split:]
+    scaler = StandardScaler()
+    Xtr_b = scaler.fit_transform(Xtr)
+    Xte_b = scaler.transform(Xte)
+    model = RandomForestRegressor(
+        n_estimators=120, max_depth=10, min_samples_split=5, min_samples_leaf=2, random_state=42
+    )
+    model.fit(Xtr_b, ytr)
+    yhat_te = model.predict(Xte_b)
+    mae = mean_absolute_error(yte, yhat_te)
+    r2 = r2_score(yte, yhat_te)
+    # next prediction
+    next_pct = float(model.predict(scaler.transform(X[-1:].copy()))[0])
+    # cap to ±15%
+    next_pct = float(np.clip(next_pct, -0.15, 0.15))
+    pred_price = current_price * (1 + next_pct)
+    return {"pred_price": pred_price, "cur_price": current_price, "pred_pct": next_pct, "mae": mae, "r2": r2, "n": len(X)}
+
+def trading_signal(cur_price, pred_price, pred_pct, horizon_label):
+    pct = pred_pct * 100
+    if horizon_label == "INTRADAY":
+        band = 0.5
+        stop = 1.5
+    elif horizon_label == "SHORT":
+        band = 1.0
+        stop = 2.5
+    else:
+        band = 2.0
+        stop = 4.0
+    if pct > band:
         action = "BUY"
-        stop_loss = current_price * (1 - stop_pct / 100)
-    elif price_change_pct < sell_threshold:
+        stoploss = cur_price * (1 - stop/100)
+    elif pct < -band:
         action = "SELL"
-        stop_loss = current_price * (1 + stop_pct / 100)
+        stoploss = cur_price * (1 + stop/100)
     else:
         action = "HOLD"
-        stop_loss = None
-    
-    direction = "UP" if price_change_pct > 0.2 else ("DOWN" if price_change_pct < -0.2 else "NEUTRAL")
-    
-    return action, current_price, stop_loss, predicted_price, price_change_pct, direction
+        stoploss = None
+    direction = "UP" if pct > 0.2 else ("DOWN" if pct < -0.2 else "NEUTRAL")
+    return action, stoploss, pct, direction
 
-def calculate_position_size(entry_price, stop_price, max_capital=15000):
+def position_size(entry_price, stop_price, cap=15000):
     if entry_price <= 0:
-        return 0, 0
-    
-    if stop_price and stop_price > 0:
-        risk_per_share = abs(entry_price - stop_price)
-        max_risk = max_capital * 0.01  # 1% risk
-        quantity = int(max_risk / risk_per_share) if risk_per_share > 0 else 0
+        return 0, 0.0
+    if stop_price:
+        risk = abs(entry_price - stop_price)
+        max_risk = cap * 0.01
+        qty = int(max_risk / risk) if risk > 0 else 0
     else:
-        quantity = int(max_capital * 0.05 / entry_price)  # 5% of capital
-    
-    quantity = max(1, min(quantity, int(max_capital / entry_price)))
-    total_cost = quantity * entry_price
-    
-    return quantity, total_cost
+        qty = int((cap * 0.05) / entry_price)
+    qty = max(1, min(qty, int(cap / entry_price)))
+    return qty, qty * entry_price
 
-# Streamlit UI
-st.title("🚀 NSE/BSE Stock Predictor - Working Version")
-st.write(f"**Market Status:** {'🟢 OPEN' if is_market_open_now() else '🔴 CLOSED'}")
+# ---------- UI ----------
+st.title("NSE/BSE Predictor — stable merges & sources")
+st.write(f"Market open? {'YES' if is_market_open_now() else 'NO'}")
 
-user_input = st.text_input("Enter stock symbol:", value="RELIANCE")
-horizon = st.selectbox("Trading Horizon:", ["INTRADAY", "SHORT", "LONG"])
-lookback = st.slider("Historical data (days):", min_value=180, max_value=730, value=365)
+user_query = st.text_input("Symbol or name (e.g., RELIANCE or RELIANCE.NS)", value="RELIANCE")
+horizon_label = st.selectbox("Horizon", ["INTRADAY","SHORT","LONG"], index=0)
+lookback_days = st.slider("Lookback days", 180, 730, 365)
 
-if st.button("🔍 Analyze Stock", type="primary"):
-    ticker = resolve_ticker(user_input)
+if st.button("Analyze", type="primary"):
+    ticker = resolve_ticker(user_query)
     if not ticker:
         st.stop()
-    
     end_date = date.today()
-    start_date = end_date - timedelta(days=lookback)
-    price_data = fetch_price_data(ticker, start_date, end_date)
-    
-    if price_data.empty:
-        st.error("No price data available")
+    start_date = end_date - timedelta(days=lookback_days)
+    px = fetch_prices_yf(ticker, start_date, end_date)
+    if px.empty:
         st.stop()
-    
-    news_headlines = fetch_news_data(ticker, limit=10)
-    sentiment_data = analyze_sentiment(news_headlines)
-    
-    horizon_days = {"INTRADAY": 1, "SHORT": 5, "LONG": 20}[horizon]
-    model_result = train_prediction_model(price_data, sentiment_data, horizon_days)
-    
-    if model_result is None:
-        st.error("Could not train model with available data")
+    headlines = fetch_news(ticker, limit=12)
+    sent_rows = score_headlines_finbert(headlines)
+    sent_daily = aggregate_sentiment_daily(sent_rows)
+    horizon_days = {"INTRADAY":1,"SHORT":5,"LONG":20}[horizon_label]
+    result = train_and_predict(px, sent_daily, horizon_days)
+    if result is None:
+        st.error("Not enough samples for modeling; increase lookback or pick another symbol.")
         st.stop()
-    
-    action, entry, stop_loss, target, price_change, direction = generate_trading_signal(
-        model_result["current_price"], 
-        model_result["predicted_price"], 
-        model_result["predicted_change"], 
-        horizon
-    )
-    
-    quantity, investment = calculate_position_size(entry, stop_loss)
-    
-    # Display results
-    st.success("✅ Analysis Complete!")
-    
-    st.subheader("📋 Trading Recommendation")
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("Stock", ticker)
-        st.metric("Action", action)
-        st.metric("Current Price", f"₹{entry:.2f}")
-        st.metric("Predicted Price", f"₹{target:.2f}")
-    
-    with col2:
-        st.metric("Expected Move", f"{price_change:+.2f}%")
-        st.metric("Direction", direction)
-        if stop_loss:
-            st.metric("Stop Loss", f"₹{stop_loss:.2f}")
-        st.metric("Investment", f"₹{investment:,.0f}")
-    
-    # Model performance
-    with st.expander("🤖 Model Performance"):
-        perf_col1, perf_col2, perf_col3 = st.columns(3)
-        mae_display = model_result['mae'] * 100
-        perf_col1.metric("Mean Absolute Error", f"{mae_display:.2f}%")
-        perf_col2.metric("R² Score", f"{model_result['r2']:.3f}")
-        perf_col3.metric("Training Samples", model_result['n_samples'])
-    
-    st.subheader("📈 Price History")
-    chart_data = price_data["Close"].reset_index()
-    chart_data.columns = ['Date', 'Close']
-    st.line_chart(chart_data.set_index('Date'))
-    
-    # Summary
-    st.subheader("📝 Trade Summary")
-    st.write(f"**Stock:** {ticker}")
-    st.write(f"**Date:** {datetime.now(INDIA_TZ).strftime('%Y-%m-%d %H:%M %Z')}")
-    st.write(f"**Term:** {horizon}")
-    st.write(f"**Market Open:** {'YES' if is_market_open_now() else 'NO'}")
-    st.write(f"**Action:** {action}")
-    st.write(f"**Price:** ₹{entry:.2f}")
-    if stop_loss:
-        st.write(f"**Stop Loss:** ₹{stop_loss:.2f}")
-    st.write(f"**Predicted Price:** ₹{target:.2f}")
-    st.write(f"**Expected Move:** {price_change:+.2f}% ({direction})")
-    st.write(f"**Quantity:** {quantity} shares")
-    st.write(f"**Investment:** ₹{investment:,.0f}")
-    
-    st.info("⚠️ This is for educational purposes only. Not financial advice. Always consult professionals before trading.")
+    action, stoploss, exp_pct, direction = trading_signal(result["cur_price"], result["pred_price"], result["pred_pct"], horizon_label)
+    qty, invest = position_size(result["cur_price"], stoploss)
+
+    st.subheader("Recommendation")
+    st.write(f"STOCK_NAME: {ticker}")
+    st.write(f"DATE: {datetime.now(INDIA_TZ).strftime('%Y-%m-%d %H:%M %Z')}")
+    st.write(f"TERM: {horizon_label}")
+    st.write(f"MARKET IS CURRENTLY OPEN? {'YES' if is_market_open_now() else 'NO'}")
+    st.write(f"ACTION: {action}")
+    st.write(f"PRICE: ₹{result['cur_price']:.2f}")
+    st.write(f"STOPLOSS: {'₹'+format(stoploss,'.2f') if stoploss else 'N/A'}")
+    st.write(f"PREDICTED PRICE: ₹{result['pred_price']:.2f}")
+    st.write(f"EXPECTED MOVE: {exp_pct:+.2f}% ({direction})")
+    st.write(f"QTY (≤ ₹15,000): {qty} (₹{invest:,.0f})")
+
+    st.subheader("Model Performance")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Test MAE", f"{result['mae']*100:.2f}%")
+    c2.metric("Test R²", f"{result['r2']:.3f}")
+    c3.metric("Samples", result["n"])
+
+    st.subheader("Close Price")
+    chart_df = px["Close"].reset_index()
+    chart_df.columns = ["Date","Close"]
+    st.line_chart(chart_df.set_index("Date"))
